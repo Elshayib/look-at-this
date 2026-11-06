@@ -7,6 +7,7 @@ import sys
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -147,7 +148,8 @@ class TargetTests(unittest.TestCase):
         cfg = lat_core.Settings()
         wins = [window(app="cua-driver.exe", title="Cua.AgentCursorOverlay.default", z=9),
                 window(app="notepad.exe", title="t.txt - Notepad", z=2)]
-        self.assertEqual(lat_core.pick_target(wins, cfg)["app_name"], "notepad.exe")
+        with mock.patch.object(lat_core, "foreground_hwnd", return_value=None):
+            self.assertEqual(lat_core.pick_target(wins, cfg)["app_name"], "notepad.exe")
 
     def test_all_windows_ignored_raises(self):
         cfg = lat_core.Settings()
