@@ -23,7 +23,7 @@ you  ▸ Ctrl+Alt+L          (or the composer's "+" menu, or /look)
   title, together, so the model can quote the exact error line instead of guessing
   from pixels.
 - **Ephemeral.** The packet is bound to one turn and expires after 300 seconds. **No packet
-  content is written to disk** — title, URL, selection and accessibility tree stay in
+  text is written to disk** — title, URL, selection and accessibility tree stay in
   memory. Disk holds only a metadata marker (`pending.json`: id, session, expiry), the PNG,
   and, separately, the companion's `companion.token` and the focused-session id in
   `active-session`. The companion runs a sweeper every 30 seconds: an expired in-memory
