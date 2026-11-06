@@ -101,7 +101,9 @@ user message, not the system prompt, so prompt caching is unaffected.
 accessibility tree (roles, labels, values, bounds), a PNG screenshot of that window,
 the browser address-bar URL when the window is a browser, and the current text
 selection (or clipboard text only if you turn `clipboard_fallback` on). Nothing else is
-read: no files, no other windows, no keylogging, no clipboard polling, no history.
+read: no files, no other windows, no keylogging, no clipboard polling, no history. The
+lock screen and Windows shell surfaces (Start, Search, the input host) are never
+captured.
 
 **Where it lives.** The screenshot is written to
 `<HERMES_HOME>/plugin-data/look-at-this/shots/lat_<id>.png`. The packet itself

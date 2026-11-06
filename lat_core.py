@@ -35,8 +35,13 @@ MAX_CONTEXT_CHARS = 9_000
 MAX_SCREENSHOT_BYTES = 8 * 1024 * 1024
 
 # Windows top-level windows that are never the user's "current window".
-IGNORED_APPS = {"cua-driver.exe", "cua.exe", "hermes.exe"}
-IGNORED_TITLE_PREFIXES = ("cua.agentcursoroverlay",)
+IGNORED_APPS = {
+    "cua-driver.exe", "cua.exe", "hermes.exe",
+    # shell surfaces: lock screen, start menu, search, text input host
+    "lockapp.exe", "shellexperiencehost.exe", "startmenuexperiencehost.exe",
+    "searchhost.exe", "textinputhost.exe", "dwm.exe",
+}
+IGNORED_TITLE_PREFIXES = ("cua.agentcursoroverlay", "windows default lock screen")
 
 BROWSER_APPS = {
     "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe", "vivaldi.exe",

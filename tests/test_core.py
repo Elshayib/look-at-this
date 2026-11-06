@@ -154,6 +154,11 @@ class TargetTests(unittest.TestCase):
         with self.assertRaises(lat_core.CaptureFailed):
             lat_core.pick_target([window(app="hermes.exe", title="Hermes", z=9)], cfg)
 
+    def test_lock_screen_is_never_the_target(self):
+        cfg = lat_core.Settings()
+        with self.assertRaises(lat_core.CaptureFailed):
+            lat_core.pick_target([window(app="LockApp.exe", title="Windows Default Lock Screen", z=9)], cfg)
+
 
 class CompanionTests(unittest.TestCase):
     def test_payload_roundtrip_writes_the_png(self):
