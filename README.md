@@ -68,7 +68,9 @@ missing, the plugin says so instead of pretending to capture.
 | **`lat_grab` tool** | Capture now and return the block inline (for "look at my screen and explain") |
 
 A packet is consumed by **one** turn. If you send without using it, it stays pending
-until it expires; if you send with it, the next turn gets it and it is gone.
+until it expires; if you send with it, the next turn gets it and it is gone. A packet
+captured in a brand-new chat that has no session id yet sits in an unbound slot and is
+consumed by that chat's first turn.
 
 The preview chip shows a thumbnail, the app/title, a checkbox per field, the redaction
 summary, and the seconds left. Unchecking a field rewrites the pending packet before
