@@ -68,11 +68,11 @@ missing, the plugin says so instead of pretending to capture.
 | **`/look fields=url,selection`** | Capture only those fields |
 | **`lat_grab` tool** | Capture now and return the block inline (for "look at my screen and explain") |
 
-A packet is consumed by **one** turn. If you send without using it, it stays pending
-until it expires; if you send with it, the next turn gets it and it is gone. A capture is
-bound to the session the Desktop had focused when it was taken — the desktop chip reports
-that session to the companion on each poll. If no session was known (Hermes was closed, or
-the chat is brand new), the packet is unbound, and the next turn in any session claims it.
+A packet is consumed by exactly **one** turn — the next one. Until you send, it stays
+pending; if you never send, it expires after 300 seconds. A capture is bound to the
+session the Desktop had focused when it was taken — the desktop chip reports that session
+to the companion on each poll. If no session was known (Hermes was closed, or the chat is
+brand new), the packet is unbound, and the next turn in any session claims it.
 
 The preview chip shows a thumbnail, the app/title, a checkbox per field, the redaction
 summary, and the seconds left. Unchecking a field rewrites the pending packet before
