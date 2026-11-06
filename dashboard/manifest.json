@@ -1,0 +1,8 @@
+{
+  "name": "look-at-this",
+  "label": "Look At This",
+  "description": "One-shot screen context: capture the window beneath Hermes as a redactable, ephemeral packet for the next message.",
+  "version": "0.1.0",
+  "icon": "ScreenFull",
+  "api": "plugin_api.py"
+}

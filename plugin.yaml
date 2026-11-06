@@ -1,0 +1,81 @@
+name: look-at-this
+version: 0.1.0
+description: >-
+  One-shot "explain this" context capture: press a hotkey (or /look, or the
+  composer's attach menu) and the window you were just in — screenshot,
+  accessibility tree, active URL, selected text and app/window title — is
+  attached as one structured, redactable, ephemeral packet to your next turn.
+  User-initiated only: nothing is captured until you ask, the packet expires
+  after 300 seconds and is consumed by one turn.
+author: Islam
+license: MIT
+manifest_version: 2
+requires_hermes: ">=0.22.6"
+platforms:
+  - windows
+  - macos
+  - linux
+provides_tools:
+  - lat_grab
+  - lat_status
+  - lat_clear
+provides_hooks:
+  - pre_llm_call
+config_schema:
+  ttl_seconds:
+    type: int
+    default: 300
+    description: How long a captured packet stays attachable before it expires.
+  excluded_apps:
+    type: list
+    default:
+      - 1password.exe
+      - 1password7.exe
+      - bitwarden.exe
+      - keepass.exe
+      - keepassxc.exe
+      - lastpass.exe
+      - dashlane.exe
+      - nordpass.exe
+      - enpass.exe
+      - keeper.exe
+    description: Process names that are never captured (case-insensitive).
+  excluded_title_patterns:
+    type: list
+    default:
+      - "(?i)incognito"
+      - "(?i)private browsing"
+      - "(?i)inprivate"
+      - "(?i)password"
+      - "(?i)vault"
+      - "(?i)unlock"
+    description: Regular expressions matched against the window title; a match refuses the capture.
+  clipboard_fallback:
+    type: bool
+    default: false
+    description: >-
+      When the accessibility provider exposes no selection, fall back to the
+      clipboard text. Off by default because the clipboard is not a selection.
+  max_elements:
+    type: int
+    default: 300
+    description: Maximum accessibility rows kept in a packet.
+  max_depth:
+    type: int
+    default: 12
+    description: Maximum accessibility tree depth walked.
+  capture_backend:
+    type: str
+    default: auto
+    description: >-
+      auto (local cua-driver, falling back to the companion when it is
+      configured), local (never leave this machine), or companion (capture on
+      another machine running companion/lat_companion.py).
+  companion_url:
+    type: str
+    default: "http://127.0.0.1:7391"
+    description: Base URL of the capture companion. Cleartext HTTP is only accepted for loopback and private networks.
+  companion_token:
+    type: secret
+    default: ""
+    description: Bearer token printed by the companion (--print-token). Stored in .env, never in config.yaml.
