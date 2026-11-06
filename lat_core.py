@@ -232,8 +232,10 @@ class CuaClient:
         except OSError as exc:
             raise CuaUnavailable(f"cua-driver could not be started: {exc}") from exc
 
-        threading.Thread(target=self._pump_stdout, daemon=True).start()
-        threading.Thread(target=self._pump_stderr, daemon=True).start()
+        q: queue.Queue = queue.Queue()
+        threading.Thread(target=self._pump_stdout, args=(self._proc, q), daemon=True).start()
+        threading.Thread(target=self._pump_stderr, args=(self._proc,), daemon=True).start()
+        self._q = q
         self._request("initialize", {
             "protocolVersion": "2025-06-18",
             "capabilities": {},
@@ -256,19 +258,24 @@ class CuaClient:
         except LookAtError:
             pass  # older drivers: implicit session still works
 
-    def _pump_stdout(self) -> None:
-        proc = self._proc
-        assert proc is not None and proc.stdout is not None
+    def _restart(self) -> None:
+        """Fresh MCP process + fresh session label. The reliable escape from a
+        retired lifecycle session, whatever the daemon's revive rules are."""
+        self.close()
+        self.label = f"{self.SESSION_LABEL}-{uuid.uuid4().hex[:8]}"
+        self._start()
+
+    def _pump_stdout(self, proc: subprocess.Popen, q: queue.Queue) -> None:
+        assert proc.stdout is not None
         try:
             for line in proc.stdout:
-                self._q.put(line)
+                q.put(line)
         except Exception:
             pass
-        self._q.put(None)
+        q.put(None)
 
-    def _pump_stderr(self) -> None:
-        proc = self._proc
-        assert proc is not None and proc.stderr is not None
+    def _pump_stderr(self, proc: subprocess.Popen) -> None:
+        assert proc.stderr is not None
         try:
             for line in proc.stderr:
                 self._stderr_tail.append(line.rstrip())
@@ -344,11 +351,15 @@ class CuaClient:
                     if isinstance(part, dict)
                 ).strip()
                 lowered = text.lower()
-                if "session has ended" in lowered:
-                    # Revive this client's named session and replay once. If the
-                    # name is gone for good, mint a new one.
-                    self._start_session()
-                    result = self._request("tools/call", {"name": tool, "arguments": arguments}, timeout=timeout)
+                if "session" in lowered and ("ended" in lowered or "start_session" in lowered):
+                    # The daemon retired this client's lifecycle session. Revive
+                    # is not dependable across driver versions, so rebuild the
+                    # MCP process with a new label and replay once.
+                    try:
+                        self._restart()
+                        result = self._request("tools/call", {"name": tool, "arguments": arguments}, timeout=timeout)
+                    except LookAtError as exc:
+                        raise CaptureFailed(str(exc)) from exc
                     if not result.get("isError"):
                         return result
                     text = " ".join(
