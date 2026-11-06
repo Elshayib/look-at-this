@@ -409,6 +409,12 @@ def _ignored(w: dict) -> bool:
     return title.lower().startswith(IGNORED_TITLE_PREFIXES)
 
 
+def _is_lock_screen(w: dict) -> bool:
+    app = str(w.get("app_name") or "").lower()
+    title = str(w.get("title") or "").lower()
+    return app == "lockapp.exe" or title.startswith("windows default lock screen")
+
+
 def _eligible(w: dict) -> bool:
     title = str(w.get("title") or "").strip()
     return bool(w.get("is_on_screen")) and bool(title) and _bounds_ok(w) and not _ignored(w)
@@ -469,6 +475,11 @@ def pick_target(windows: list[dict], settings: Settings, hint: str = "") -> dict
         for w in pool:
             try:
                 if int(w.get("window_id")) == fg:
+                    if _is_lock_screen(w):
+                        raise CaptureFailed(
+                            "The screen is locked, so nothing was captured.",
+                            detail="Unlock the desktop and try again.",
+                        )
                     rule = exclusion_rule(w, settings)
                     if rule:
                         raise ExcludedWindow(
