@@ -1,0 +1,38 @@
+name: look-at-this
+repo: https://github.com/Elshayib/look-at-this
+sha: 5b39b37ba89c8d7c7dd3497774aab06cbe0fa2b1
+description: >-
+  One-shot "explain this" context capture: a hotkey, the composer's attach menu or
+  /look grabs the window you were just in (screenshot, accessibility tree, active
+  URL, selected text, app/window title) and attaches it as one redactable,
+  ephemeral packet to your next Hermes message. User-initiated only; the packet
+  expires after 300 seconds, is consumed by one turn, refuses excluded windows
+  (password managers, incognito) before capturing, and redacts secrets in the text
+  fields. Disclosure — captures only on request; the PNG lives in plugin data until
+  its TTL (or /look clear); the packet text goes to the configured model provider
+  with that turn; redaction is text-only.
+maintainer: Elshayib
+tier: community
+category: desktop
+requires_hermes: ">=0.22.6"
+docs_url: https://github.com/Elshayib/look-at-this#readme
+version: "0.1.0"
+platforms:
+  - windows
+  - macos
+  - linux
+capabilities:
+  provides_tools:
+    - lat_grab
+    - lat_status
+    - lat_clear
+  provides_hooks:
+    - pre_llm_call
+  provides_middleware: []
+  requires_env: []
+known_issues:
+  - The Desktop hotkey is in-app, not system-wide: the Desktop plugin SDK has no global-shortcut door. Core's HUD modifier-tap (Ctrl+Alt) already summons Hermes from any app; use it, then the plugin hotkey.
+  - The desktop half of a unified package inventories disabled and must be toggled on once in Capabilities -> Plugins.
+  - /look runs in the gateway process. On a remote gateway, set capture_backend=companion and run companion/lat_companion.py on the machine to capture; the companion must be reachable from the gateway.
+  - Redaction is text-only; the screenshot is not altered.
+  - Windows UIPI prevents a medium-integrity agent from enumerating elevated (admin) windows. Window context is unavailable on Windows ARM64, and native Wayland restricts capture and global shortcuts.

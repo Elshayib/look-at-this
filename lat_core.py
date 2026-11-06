@@ -196,8 +196,11 @@ def resolve_driver() -> str | None:
 class CuaClient:
     """One long-lived ``cua-driver mcp`` stdio session, restarted on failure."""
 
+    SESSION_LABEL = "look-at-this"
+
     def __init__(self, command: str | None = None):
         self.command = command or resolve_driver()
+        self.label = f"{self.SESSION_LABEL}-{uuid.uuid4().hex[:8]}"
         self._proc: subprocess.Popen | None = None
         self._q: queue.Queue[str | None] = queue.Queue()
         self._lock = threading.RLock()
@@ -232,6 +235,21 @@ class CuaClient:
             "clientInfo": {"name": "look-at-this", "version": "0.1.0"},
         }, timeout=20)
         self._notify("notifications/initialized", {})
+        self._start_session()
+
+    def _start_session(self) -> None:
+        """Create (or revive) this client's own lifecycle session.
+
+        The daemon retires an idle implicit session; a unique named session per
+        client, passed on every capture call that accepts it, keeps captures
+        independent of whatever the Desktop's own computer_use session is doing.
+        """
+        try:
+            self._request("tools/call", {
+                "name": "start_session", "arguments": {"session": self.label},
+            }, timeout=20)
+        except LookAtError:
+            pass  # older drivers: implicit session still works
 
     def _pump_stdout(self) -> None:
         proc = self._proc
@@ -320,6 +338,18 @@ class CuaClient:
                     str(part.get("text") or "") for part in result.get("content") or []
                     if isinstance(part, dict)
                 ).strip()
+                lowered = text.lower()
+                if "session has ended" in lowered:
+                    # Revive this client's named session and replay once. If the
+                    # name is gone for good, mint a new one.
+                    self._start_session()
+                    result = self._request("tools/call", {"name": tool, "arguments": arguments}, timeout=timeout)
+                    if not result.get("isError"):
+                        return result
+                    text = " ".join(
+                        str(part.get("text") or "") for part in result.get("content") or []
+                        if isinstance(part, dict)
+                    ).strip()
                 raise CaptureFailed(text or f"cua-driver {tool} returned an error")
             return result
 
@@ -702,6 +732,7 @@ def _capture_local(settings: Settings, *, hint: str = "", include_screenshot: bo
         "max_elements": settings.max_elements,
         "max_depth": settings.max_depth,
         "include_screenshot": bool(include_screenshot),
+        "session": c.label,
     }
     if include_screenshot:
         args["screenshot_out_file"] = str(shot_path)
