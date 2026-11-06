@@ -251,6 +251,16 @@ class PacketDictTests(unittest.TestCase):
         self.assertGreater(pkt_nan.created_at, 0)
         self.assertGreaterEqual(pkt_nan.public()["expires_in"], 0)
 
+    def test_absurd_finite_timestamps_are_bounded(self):
+        data = packet(session_id="").to_dict()
+        data["created_at"] = 1e20
+        data["expires_at"] = 1e20
+        pkt = lat_core.Packet.from_dict(data)
+        self.assertLess(pkt.created_at, 1e12)
+        self.assertLess(pkt.expires_at, 1e12)
+        self.assertGreaterEqual(pkt.public()["expires_in"], 0)
+        self.assertIn("captured", lat_core.render_context(pkt))
+
     def test_screenshot_must_be_a_png_inside_shots(self):
         data = packet(session_id="").to_dict()
         token = lat_core.data_dir() / "companion.token"

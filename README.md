@@ -292,7 +292,7 @@ applies) on first run; a gateway with no `companion_token` setting reads that fi
 ## Development
 
 ```bash
-python -m unittest discover -s tests -v      # 59 unit tests, no driver needed
+python -m unittest discover -s tests -v      # 60 unit tests, no driver needed
 hermes plugins validate . --install-deps     # catalog gate
 hermes plugins doctor .                      # real register(ctx) probe
 ```
