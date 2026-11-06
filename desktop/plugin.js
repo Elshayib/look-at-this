@@ -52,10 +52,6 @@ function invalidate() {
 
 async function captureNow() {
   const sessionId = focusedSession()
-  if (!sessionId) {
-    host.notify({ kind: 'warning', message: 'Look At This: open a chat first.' })
-    return
-  }
   try {
     const res = await rest('/capture', { method: 'POST', body: { session_id: sessionId } })
     if (!res || res.ok !== true) {
@@ -89,9 +85,9 @@ function PendingChip() {
   const qc = useQueryClient()
 
   const pending = useQuery({
-    queryKey: ['look-at-this', 'pending', sessionId],
-    queryFn: () => rest(`/pending?session_id=${encodeURIComponent(sessionId)}&preview=1`),
-    enabled: Boolean(sessionId),
+    queryKey: ['look-at-this', 'pending', sessionId || 'next'],
+    queryFn: () => rest(`/pending?session_id=${encodeURIComponent(sessionId || '')}&preview=1`),
+    enabled: true,
     refetchInterval: 5000,
     staleTime: 1000,
     retry: false

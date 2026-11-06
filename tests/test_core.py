@@ -103,6 +103,19 @@ class StoreTests(unittest.TestCase):
         lat_core.STORE.put(packet())
         self.assertTrue(lat_core.STORE.clear("s1"))
 
+    def test_unbound_packet_is_consumed_by_a_brand_new_chat(self):
+        lat_core.STORE.put(packet(session_id=""))
+        got = lat_core.STORE.consume("brand-new-session")
+        self.assertIsNotNone(got)
+        self.assertIsNone(lat_core.STORE.get("brand-new-session"))
+
+    def test_session_packet_wins_over_the_unbound_slot(self):
+        lat_core.STORE.put(packet(id="unbound", session_id=""))
+        lat_core.STORE.put(packet(id="specific", session_id="s1"))
+        got = lat_core.STORE.consume("s1")
+        self.assertEqual(got.id, "specific")
+        self.assertIsNotNone(lat_core.STORE.get(""))
+
 
 class ContextTests(unittest.TestCase):
     def test_context_labels_data_as_untrusted(self):

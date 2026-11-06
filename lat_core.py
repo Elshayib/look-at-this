@@ -964,6 +964,10 @@ def capture(settings: Settings, *, hint: str = "", include_screenshot: bool = Tr
 
 ALL_FIELDS = ("screenshot", "accessibility", "url", "selection")
 
+# A packet captured from a brand-new chat has no session id yet. It is stored
+# under this key and consumed by the next turn in any session of the profile.
+UNBOUND = "__next__"
+
 
 @dataclass
 class Packet:
@@ -1118,10 +1122,28 @@ class PacketStore:
         self._by_session: dict[str, Packet] = {}
         self._max_sessions = 32
 
+    @staticmethod
+    def _key(session_id: str) -> str:
+        return session_id or UNBOUND
+
+    def _lookup_locked(self, session_id: str) -> tuple[str, Packet | None]:
+        """Specific session first, then the unbound slot a fresh chat writes to."""
+        key = self._key(session_id)
+        pkt = self._by_session.get(key)
+        if pkt is None and key != UNBOUND:
+            pkt = self._by_session.get(UNBOUND)
+            if pkt is not None:
+                key = UNBOUND
+        if pkt is not None and pkt.expires_at <= time.time():
+            self._by_session.pop(key, None)
+            return key, None
+        return key, pkt
+
     def put(self, pkt: Packet) -> Packet:
+        key = self._key(pkt.session_id)
         with self._lock:
-            old = self._by_session.get(pkt.session_id)
-            self._by_session[pkt.session_id] = pkt
+            old = self._by_session.get(key)
+            self._by_session[key] = pkt
             self._evict_locked()
         if old and old.id != pkt.id and old.screenshot_path:
             Path(old.screenshot_path).unlink(missing_ok=True)
@@ -1129,26 +1151,22 @@ class PacketStore:
 
     def get(self, session_id: str) -> Packet | None:
         with self._lock:
-            pkt = self._by_session.get(session_id)
-            if pkt is None:
-                return None
-            if pkt.expires_at <= time.time():
-                del self._by_session[session_id]
-                return None
-            return pkt
+            return self._lookup_locked(session_id)[1]
 
     def consume(self, session_id: str) -> Packet | None:
         """Read once: the binding is gone afterwards; the PNG survives to TTL."""
         with self._lock:
-            pkt = self.get(session_id)
+            key, pkt = self._lookup_locked(session_id)
             if pkt is None:
                 return None
-            del self._by_session[session_id]
+            del self._by_session[key]
             return pkt
 
     def clear(self, session_id: str) -> bool:
         with self._lock:
-            pkt = self._by_session.pop(session_id, None)
+            key, pkt = self._lookup_locked(session_id)
+            if pkt is not None:
+                del self._by_session[key]
         if pkt is None:
             return False
         if pkt.screenshot_path:
@@ -1157,7 +1175,7 @@ class PacketStore:
 
     def update_fields(self, session_id: str, fields: list[str]) -> Packet | None:
         with self._lock:
-            pkt = self.get(session_id)
+            _key, pkt = self._lookup_locked(session_id)
             if pkt is None:
                 return None
             pkt.fields = [f for f in fields if f in ALL_FIELDS]
@@ -1213,9 +1231,11 @@ STORE = _shared
 
 def grab_for_turn(settings: Settings, session_id: str, *, hint: str = "",
                   fields: list[str] | None = None) -> tuple[Packet, str]:
-    """Capture, store for the next turn, and return the preview block for the user."""
-    if not session_id:
-        raise NoSession("This surface did not provide a session id, so there is nothing to attach to.")
+    """Capture, store for the next turn, and return the preview block for the user.
+
+    An empty ``session_id`` (a brand-new chat that has no id yet) is stored in
+    the unbound slot and consumed by the next turn of any session in the profile.
+    """
     STORE.sweep_files(settings.ttl_seconds)
     cap = capture(settings, hint=hint)
     pkt = make_packet(cap, settings, session_id, fields)
