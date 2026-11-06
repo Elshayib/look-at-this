@@ -1,8 +1,8 @@
 name: look-at-this
 repo: https://github.com/Elshayib/look-at-this
-sha: da5be42d53dbc90bb2ac472d7d0b5fadae86392e
+sha: 8307f324e2e87203f43d10305a2bef871c1a56c3
 readme: true
-image: https://raw.githubusercontent.com/Elshayib/look-at-this/da5be42d53dbc90bb2ac472d7d0b5fadae86392e/assets/look-at-this.png
+image: https://raw.githubusercontent.com/Elshayib/look-at-this/8307f324e2e87203f43d10305a2bef871c1a56c3/assets/look-at-this.png
 description: >-
   One-shot "explain this" context capture: a hotkey, the composer's attach menu or
   /look grabs the window you were just in (screenshot, accessibility tree, active
@@ -10,10 +10,11 @@ description: >-
   ephemeral packet to your next Hermes message. User-initiated only; the packet
   expires after 300 seconds, is consumed by one turn, refuses excluded windows
   (password managers, incognito) before capturing, and redacts secrets in the text
-  fields. Disclosure — captures only on request; the packet text is held in the
-  companion's memory; only a metadata marker (id/session/expiry) and the PNG touch
-  disk; the PNG is deleted at TTL, /look clear, or replacement; the packet text goes
-  to the configured model provider with that turn; redaction is text-only.
+  fields. Disclosure — captures only on request; the packet text is held in memory (the
+  companion for hotkey captures, the gateway for /look captures); only a metadata marker
+  (id/session/expiry) and the PNG touch disk; the PNG is deleted at TTL, /look clear, or
+  replacement; the packet text goes to the configured model provider with that turn;
+  redaction is text-only.
 maintainer: Elshayib
 tier: community
 category: desktop
@@ -34,7 +35,7 @@ capabilities:
   provides_middleware: []
   requires_env: []
 known_issues:
-  - The system-wide hotkey is Windows-only and owned by companion/lat_companion.py --hotkey: the Desktop plugin SDK has no global-shortcut door. The companion must be running, the packet is held in its memory and fetched by the gateway, and a remote gateway needs companion_url/companion_token. The in-app keybind covers the focused-Hermes case.
+  - The system-wide hotkey is Windows-only and owned by companion/lat_companion.py --hotkey: the Desktop plugin SDK has no global-shortcut door. The companion must be running, the packet is held in its memory and fetched by the gateway, and a remote gateway needs companion_url/companion_token. The desktop chip relays the focused session id to the companion (over companion_url/companion_token when the gateway is remote), so a hotkey packet binds to that chat. The in-app keybind covers the focused-Hermes case.
   - The desktop half of a unified package inventories disabled and must be toggled on once in Capabilities -> Plugins.
   - /look runs in the gateway process. On a remote gateway, set capture_backend=companion and run companion/lat_companion.py on the machine to capture; the companion must be reachable from the gateway.
   - Redaction is text-only; the screenshot is not altered.
