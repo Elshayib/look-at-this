@@ -387,6 +387,18 @@ def foreground_hwnd() -> int | None:
         return None
 
 
+def hwnd_title(hwnd: int) -> str:
+    """Window title for an HWND we may not find in the driver's window list."""
+    if sys.platform != "win32" or not hwnd:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(512)
+        ctypes.windll.user32.GetWindowTextW(int(hwnd), buf, 512)
+        return buf.value or ""
+    except Exception:
+        return ""
+
+
 def _records(result: dict) -> list[dict]:
     sc = result.get("structuredContent") or {}
     windows = sc.get("windows") or sc.get("_legacy_windows") or []
@@ -472,6 +484,11 @@ def pick_target(windows: list[dict], settings: Settings, hint: str = "") -> dict
 
     fg = foreground_hwnd()
     if fg is not None:
+        if "lock screen" in hwnd_title(fg).lower():
+            raise CaptureFailed(
+                "The screen is locked, so nothing was captured.",
+                detail="Unlock the desktop and try again.",
+            )
         for w in pool:
             try:
                 if int(w.get("window_id")) == fg:
@@ -491,6 +508,16 @@ def pick_target(windows: list[dict], settings: Settings, hint: str = "") -> dict
                     break
             except (TypeError, ValueError):
                 continue
+
+    # The lock screen can sit above everything without being "foreground" from
+    # this process. If it is the topmost window, refuse rather than capture a
+    # window behind it.
+    tops = sorted([w for w in pool if w.get("is_on_screen")], key=_z, reverse=True)
+    if tops and _is_lock_screen(tops[0]):
+        raise CaptureFailed(
+            "The screen is locked, so nothing was captured.",
+            detail="Unlock the desktop and try again.",
+        )
 
     candidates = [w for w in pool if _eligible(w)]
     if not candidates:
