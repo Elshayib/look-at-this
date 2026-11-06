@@ -14,6 +14,10 @@ def pre_llm_call(session_id: str = "", **kwargs):
         return None
     try:
         pkt = lat_core.STORE.consume(session_id)
+        if pkt is None:
+            # A global-hotkey capture from the companion lands here: it has no
+            # session id, so the next turn in any session consumes it.
+            pkt = lat_core.take_spooled()
     except Exception:
         logger.exception("look-at-this: packet store failed")
         return None

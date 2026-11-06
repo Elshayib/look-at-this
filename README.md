@@ -76,6 +76,30 @@ The preview chip shows a thumbnail, the app/title, a checkbox per field, the red
 summary, and the seconds left. Unchecking a field rewrites the pending packet before
 you send.
 
+## The global hotkey (the popup)
+
+Press **Ctrl+Alt+L** in any app. The companion captures the window in front of you,
+then Hermes' Quick Entry popup opens with the packet already queued. Ask your question,
+press Enter, and the answer arrives in a chat.
+
+```bash
+# once, on the machine with the screen
+python companion/lat_companion.py --hotkey
+
+# keep it across logins
+python companion/lat_companion.py --install-autostart
+```
+
+The companion is a separate local process because the Desktop plugin SDK has no
+global-shortcut door, and a renderer cannot capture a native window. It registers the
+chord with the OS (`RegisterHotKey`), captures through the same cua-driver path,
+writes the packet to `plugin-data/look-at-this/spool/`, and then opens Quick Entry
+(`Ctrl+Shift+Space` by default — it must match the Desktop's Quick Entry shortcut).
+One pending packet at a time: a new capture replaces the previous one.
+
+`/look` and the in-app hotkey still work without the companion; it exists for the
+"press one key while I'm in another app" flow.
+
 ## What the model receives
 
 ```
@@ -171,11 +195,12 @@ the attach entry and the chip (or quit the app). Close the companion if you ran 
 
 ## Limitations (read before filing a bug)
 
-1. **The hotkey is in-app, not system-wide.** The Desktop plugin SDK has no global
-   shortcut door. Core already ships the system-wide part: the HUD's opt-in
-   Ctrl+Alt tap summons Hermes from any app, and Ctrl+Shift+G snaps it to the pointer.
-   Use those, then our hotkey. A global plugin-owned chord needs an SDK seam (rule 8
-   of the catalog: ask for the seam, don't patch around it).
+1. **The global hotkey lives in the companion.** The Desktop plugin SDK has no global
+   shortcut door, and the renderer cannot capture a native window, so the system-wide
+   chord is owned by `companion/lat_companion.py` (`--hotkey`), which captures and then
+   opens Hermes' Quick Entry popup. The in-app keybind remains for when Hermes is
+   already focused. Windows today; macOS/Linux need their own hotkey registration
+   (the capture half already runs there).
 2. **The desktop half is opt-in.** A unified package's UI half inventories disabled;
    toggle it on once.
 3. **The gateway captures, not necessarily your laptop.** `/look` runs in the gateway
@@ -195,6 +220,8 @@ Settings → Plugins.
 | Key | Default | Meaning |
 |---|---|---|
 | `ttl_seconds` | `300` | Packet lifetime |
+| `global_hotkey` | `ctrl+alt+l` | chord the companion registers system-wide (Windows) |
+| `quick_entry_hotkey` | `ctrl+shift+space` | chord that opens Hermes Quick Entry; must match the Desktop |
 | `excluded_apps` | password managers | process names never captured |
 | `excluded_title_patterns` | incognito/private/password/vault/unlock | regexes matched against the title |
 | `clipboard_fallback` | `false` | use clipboard text when UIA reports no selection |

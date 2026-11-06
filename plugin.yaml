@@ -64,6 +64,14 @@ config_schema:
     type: int
     default: 12
     description: Maximum accessibility tree depth walked.
+  global_hotkey:
+    type: str
+    default: ctrl+alt+l
+    description: Chord the companion registers system-wide (Windows). Pressing it captures the app you are in and opens Quick Entry.
+  quick_entry_hotkey:
+    type: str
+    default: ctrl+shift+space
+    description: Chord that opens Hermes Quick Entry; must match the Desktop's Quick Entry shortcut.
   capture_backend:
     type: str
     default: auto

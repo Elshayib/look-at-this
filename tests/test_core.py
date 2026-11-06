@@ -210,6 +210,65 @@ class CompanionTests(unittest.TestCase):
         self.assertFalse(lat_core._plain_http_allowed("ftp://127.0.0.1"))
 
 
+class SpoolTests(unittest.TestCase):
+    def setUp(self):
+        for path in lat_core.spool_dir().glob("*.json"):
+            path.unlink(missing_ok=True)
+
+    def test_roundtrip_is_single_use(self):
+        pkt = packet(session_id="", id="spool1")
+        lat_core.spool_packet(pkt)
+        got = lat_core.take_spooled()
+        self.assertIsNotNone(got)
+        self.assertEqual(got.id, "spool1")
+        self.assertEqual(got.app, "chrome.exe")
+        self.assertIsNone(lat_core.take_spooled())
+
+    def test_expired_spool_is_dropped(self):
+        lat_core.spool_packet(packet(session_id="", expires_at=time.time() - 1))
+        self.assertIsNone(lat_core.take_spooled())
+
+    def test_new_capture_replaces_the_previous_spool(self):
+        lat_core.spool_packet(packet(session_id="", id="first"))
+        lat_core.spool_packet(packet(session_id="", id="second"))
+        self.assertEqual(len(list(lat_core.spool_dir().glob("*.json"))), 1)
+        self.assertEqual(lat_core.take_spooled().id, "second")
+
+    def test_from_dict_rejects_another_schema(self):
+        with self.assertRaises(ValueError):
+            lat_core.Packet.from_dict({"schema": "something-else"})
+
+    def test_foreign_screenshot_path_is_ignored(self):
+        data = packet(session_id="").to_dict()
+        data["screenshot_path"] = r"C:\Windows\notepad.exe"
+        pkt = lat_core.Packet.from_dict(data)
+        self.assertIsNone(pkt.screenshot_path)
+
+
+class CompanionChordTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "lat_companion_under_test", ROOT / "companion" / "lat_companion.py")
+        cls.mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.mod)
+
+    def test_ctrl_alt_letter(self):
+        mods, vk = self.mod.parse_chord("ctrl+alt+l")
+        self.assertEqual(mods, 0x0002 | 0x0001)
+        self.assertEqual(vk, ord("L"))
+
+    def test_space(self):
+        mods, vk = self.mod.parse_chord("ctrl+shift+space")
+        self.assertEqual(mods, 0x0002 | 0x0004)
+        self.assertEqual(vk, 0x20)
+
+    def test_bad_chord(self):
+        with self.assertRaises(ValueError):
+            self.mod.parse_chord("hyper+l")
+
+
 class ManifestTests(unittest.TestCase):
     def test_tool_names_do_not_collide_with_builtin_namespaces(self):
         text = (ROOT / "plugin.yaml").read_text(encoding="utf-8")

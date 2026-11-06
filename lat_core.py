@@ -1016,6 +1016,68 @@ class Packet:
             out["preview_data_url"] = _data_url(self.screenshot_path)
         return out
 
+    def to_dict(self) -> dict[str, Any]:
+        """Serializable form used by the companion spool (no image bytes)."""
+        return {
+            "schema": SCHEMA,
+            "id": self.id,
+            "session_id": self.session_id,
+            "created_at": self.created_at,
+            "expires_at": self.expires_at,
+            "app": self.app,
+            "pid": self.pid,
+            "window_id": self.window_id,
+            "title": self.title,
+            "url": self.url,
+            "url_source": self.url_source,
+            "selection": self.selection,
+            "selection_source": self.selection_source,
+            "screenshot_path": self.screenshot_path,
+            "screenshot_width": self.screenshot_width,
+            "screenshot_height": self.screenshot_height,
+            "tree_markdown": self.tree_markdown,
+            "element_count": self.element_count,
+            "returned_count": self.returned_count,
+            "truncated": self.truncated,
+            "fields": list(self.fields),
+            "redactions": dict(self.redactions),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Packet":
+        if not isinstance(data, dict) or data.get("schema") != SCHEMA:
+            raise ValueError("not a look-at-this packet")
+        shot = data.get("screenshot_path")
+        if shot:
+            try:
+                Path(shot).resolve().relative_to(data_dir().resolve())
+            except (OSError, ValueError):
+                shot = None  # never trust a path outside our own data dir
+        fields = [f for f in data.get("fields") or ALL_FIELDS if f in ALL_FIELDS]
+        return cls(
+            id=str(data.get("id") or uuid.uuid4().hex[:12]),
+            session_id=str(data.get("session_id") or ""),
+            created_at=float(data.get("created_at") or time.time()),
+            expires_at=float(data.get("expires_at") or time.time() + DEFAULT_TTL),
+            app=str(data.get("app") or "unknown"),
+            pid=int(data.get("pid") or 0),
+            window_id=data.get("window_id"),
+            title=str(data.get("title") or ""),
+            url=data.get("url"),
+            url_source=data.get("url_source"),
+            selection=data.get("selection"),
+            selection_source=data.get("selection_source"),
+            screenshot_path=shot,
+            screenshot_width=data.get("screenshot_width"),
+            screenshot_height=data.get("screenshot_height"),
+            tree_markdown=str(data.get("tree_markdown") or ""),
+            element_count=int(data.get("element_count") or 0),
+            returned_count=int(data.get("returned_count") or 0),
+            truncated=bool(data.get("truncated")),
+            fields=fields,
+            redactions={str(k): int(v) for k, v in (data.get("redactions") or {}).items()},
+        )
+
 
 def _clip(text: str | None, n: int) -> str | None:
     if text is None:
@@ -1223,6 +1285,93 @@ if _shared is None:
     _shared = PacketStore()
     sys.modules["hermes_look_at_this_store"] = _shared
 STORE = _shared
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Spool: a packet written by the companion, read by the gateway on the next turn
+# ─────────────────────────────────────────────────────────────────────────────
+
+def spool_dir() -> Path:
+    d = data_dir() / "spool"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _spool_files() -> list[Path]:
+    try:
+        return sorted(spool_dir().glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        return []
+
+
+def spool_packet(pkt: Packet) -> str:
+    """Atomically write one packet for the next turn. Newest wins, older ones go."""
+    d = spool_dir()
+    path = d / f"{pkt.id}.json"
+    tmp = d / f".{pkt.id}.tmp"
+    tmp.write_text(json.dumps(pkt.to_dict(), ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+    for old in _spool_files():
+        if old == path:
+            continue
+        try:
+            prior = Packet.from_dict(json.loads(old.read_text(encoding="utf-8")))
+            if prior.screenshot_path and prior.screenshot_path != pkt.screenshot_path:
+                Path(prior.screenshot_path).unlink(missing_ok=True)
+        except (OSError, TypeError, ValueError):
+            pass
+        old.unlink(missing_ok=True)
+    return str(path)
+
+
+def take_spooled() -> Packet | None:
+    """Consume the newest valid spooled packet (single use)."""
+    now = time.time()
+    for path in _spool_files():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            path.unlink(missing_ok=True)
+            continue
+        try:
+            pkt = Packet.from_dict(data)
+        except (TypeError, ValueError):
+            path.unlink(missing_ok=True)
+            continue
+        path.unlink(missing_ok=True)
+        if pkt.expires_at <= now:
+            if pkt.screenshot_path:
+                Path(pkt.screenshot_path).unlink(missing_ok=True)
+            continue
+        return pkt
+    return None
+
+
+def spooled_info() -> dict[str, Any] | None:
+    for path in _spool_files():
+        try:
+            pkt = Packet.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, TypeError, ValueError):
+            continue
+        if pkt.expires_at <= time.time():
+            continue
+        return pkt.public()
+    return None
+
+
+def clear_spooled() -> bool:
+    cleared = False
+    for path in _spool_files():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            pkt = Packet.from_dict(data)
+            if pkt.screenshot_path:
+                Path(pkt.screenshot_path).unlink(missing_ok=True)
+        except (OSError, TypeError, ValueError):
+            pass
+        path.unlink(missing_ok=True)
+        cleared = True
+    return cleared
 
 
 # ─────────────────────────────────────────────────────────────────────────────

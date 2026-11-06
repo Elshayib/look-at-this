@@ -62,10 +62,12 @@ def lat_status(args: dict, session_id: str = "", **kwargs) -> str:
     return _json({
         "ok": True,
         "pending": pkt.public() if pkt else None,
+        "spooled": lat_core.spooled_info() if pkt is None else None,
         "ttl_seconds": settings().ttl_seconds,
     })
 
 
 def lat_clear(args: dict, session_id: str = "", **kwargs) -> str:
     cleared = lat_core.STORE.clear(session_id) if session_id else False
+    cleared = lat_core.clear_spooled() or cleared
     return _json({"ok": True, "cleared": cleared})
