@@ -58,16 +58,14 @@ def lat_grab(args: dict, session_id: str = "", **kwargs) -> str:
 
 
 def lat_status(args: dict, session_id: str = "", **kwargs) -> str:
-    pkt = lat_core.STORE.get(session_id) if session_id else None
+    pkt = lat_core.pending_packet(session_id)
     return _json({
         "ok": True,
         "pending": pkt.public() if pkt else None,
-        "spooled": lat_core.spooled_info() if pkt is None else None,
         "ttl_seconds": settings().ttl_seconds,
     })
 
 
 def lat_clear(args: dict, session_id: str = "", **kwargs) -> str:
-    cleared = lat_core.STORE.clear(session_id) if session_id else False
-    cleared = lat_core.clear_spooled() or cleared
+    cleared = lat_core.clear_pending(session_id)
     return _json({"ok": True, "cleared": cleared})

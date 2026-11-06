@@ -44,16 +44,7 @@ CORE = _load_core()
 
 
 def _settings():
-    try:
-        from hermes_cli.config import load_config_readonly
-        cfg = load_config_readonly() or {}
-        entry = (((cfg.get("plugins") or {}).get("entries") or {}).get("look-at-this") or {})
-        data = entry.get("settings") or {}
-    except Exception:
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    return CORE.Settings.from_getter(lambda key, default=None: data.get(key, default))
+    return CORE.load_settings()[0]
 
 
 def _bad(exc: Exception) -> JSONResponse:
@@ -103,10 +94,9 @@ def capture(payload: dict = Body(...)) -> Any:
 @router.get("/pending")
 def pending(session_id: str = "", preview: int = 0) -> Any:
     try:
-        packet = CORE.STORE.get(session_id.strip()) if session_id.strip() else None
-        if packet is None:
-            return {"ok": True, "pending": None}
-        return {"ok": True, "pending": packet.public(include_preview=bool(preview))}
+        packet = CORE.pending_packet(session_id)
+        pending_obj = packet.public(include_preview=bool(preview)) if packet else None
+        return {"ok": True, "pending": pending_obj}
     except Exception as exc:
         return _bad(exc)
 
@@ -120,10 +110,8 @@ def update_pending(payload: dict = Body(...)) -> Any:
                 "ok": False, "code": "no_fields", "error": "fields must name at least one of "
                 "screenshot, accessibility, url, selection",
             })
-        packet = CORE.STORE.update_fields(_session(payload), fields)
-        if packet is None:
-            return {"ok": True, "pending": None}
-        return {"ok": True, "pending": packet.public()}
+        packet = CORE.update_pending_fields(_session(payload), fields)
+        return {"ok": True, "pending": packet.public() if packet else None}
     except Exception as exc:
         return _bad(exc)
 
@@ -131,6 +119,16 @@ def update_pending(payload: dict = Body(...)) -> Any:
 @router.post("/clear")
 def clear(payload: dict = Body(...)) -> Any:
     try:
-        return {"ok": True, "cleared": CORE.STORE.clear(_session(payload))}
+        cleared = CORE.clear_pending(_session(payload))
+        return {"ok": True, "cleared": cleared}
+    except Exception as exc:
+        return _bad(exc)
+
+
+@router.post("/active-session")
+def active_session(payload: dict = Body(...)) -> Any:
+    try:
+        CORE.write_active_session(_session(payload))
+        return {"ok": True}
     except Exception as exc:
         return _bad(exc)

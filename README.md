@@ -22,9 +22,10 @@ you  ▸ Ctrl+Alt+L          (or the composer's "+" menu, or /look)
 - **One packet, not an image.** Screenshot + accessibility rows + URL + selection +
   title, together, so the model can quote the exact error line instead of guessing
   from pixels.
-- **Ephemeral.** The packet is bound to one turn, expires after 300 seconds, and is
-  consumed on read. The screenshot file is deleted at expiry (or immediately with
-  `/look clear`).
+- **Ephemeral.** The packet is bound to one turn and expires after 300 seconds. Its text
+  stays out of every file on disk; disk holds only a metadata marker (id, session, expiry)
+  and the PNG. The PNG is deleted at expiry, on `/look clear`, or when a new capture
+  replaces it.
 - **Consent first.** Per-field toggles in the preview chip, an exclude-list that fails
   closed (password managers, incognito, banking), and text redaction before anything
   reaches the model.
@@ -68,9 +69,10 @@ missing, the plugin says so instead of pretending to capture.
 | **`lat_grab` tool** | Capture now and return the block inline (for "look at my screen and explain") |
 
 A packet is consumed by **one** turn. If you send without using it, it stays pending
-until it expires; if you send with it, the next turn gets it and it is gone. A packet
-captured in a brand-new chat that has no session id yet sits in an unbound slot and is
-consumed by that chat's first turn.
+until it expires; if you send with it, the next turn gets it and it is gone. A capture is
+bound to the session the Desktop had focused when it was taken — the desktop chip reports
+that session to the companion on each poll. If no session was known (Hermes was closed, or
+the chat is brand new), the packet is unbound, and the next turn in any session claims it.
 
 The preview chip shows a thumbnail, the app/title, a checkbox per field, the redaction
 summary, and the seconds left. Unchecking a field rewrites the pending packet before
@@ -86,16 +88,28 @@ press Enter, and the answer arrives in a chat.
 # once, on the machine with the screen
 python companion/lat_companion.py --hotkey
 
+# Quick Entry rebound or disabled? queue without synthesizing the chord
+python companion/lat_companion.py --hotkey --no-open
+
 # keep it across logins
 python companion/lat_companion.py --install-autostart
 ```
 
 The companion is a separate local process because the Desktop plugin SDK has no
 global-shortcut door, and a renderer cannot capture a native window. It registers the
-chord with the OS (`RegisterHotKey`), captures through the same cua-driver path,
-writes the packet to `plugin-data/look-at-this/spool/`, and then opens Quick Entry
-(`Ctrl+Shift+Space` by default — it must match the Desktop's Quick Entry shortcut).
-One pending packet at a time: a new capture replaces the previous one.
+chord with the OS (`RegisterHotKey`), captures through the same cua-driver path, and keeps
+the packet **in its own memory**. Disk gets only a metadata marker —
+`plugin-data/look-at-this/pending.json`, exactly `{id, session_id, expires_at}` — and the
+PNG under `shots/`; title, URL, selection and accessibility tree never leave the process
+except over its authenticated port. It then synthesizes the Quick Entry shortcut
+(`quick_entry_hotkey`, `Ctrl+Shift+Space` by default). That value **must match Settings →
+Keyboard Shortcuts → Quick Entry**; if Quick Entry is disabled or rebound, run the
+companion with `--no-open` — it queues the packet without sending keys, and you pick it up
+from the composer chip or `lat_status`. The gateway fetches the packet on the next
+`pre_llm_call` — from the local companion over its loopback port, or, for a remote
+gateway, over `companion_url` with `companion_token` (which falls back to
+`plugin-data/look-at-this/companion.token`). One pending packet at a time: a new capture
+replaces the previous one and deletes its PNG.
 
 `/look` and the in-app hotkey still work without the companion; it exists for the
 "press one key while I'm in another app" flow.
@@ -131,28 +145,39 @@ read: no files, no other windows, no keylogging, no clipboard polling, no histor
 lock screen and Windows shell surfaces (Start, Search, the input host) are never
 captured.
 
-**Where it lives.** The screenshot is written to
-`<HERMES_HOME>/plugin-data/look-at-this/shots/lat_<id>.png`. The packet itself
-(title, URL, selection, tree) is held **in memory** in the gateway process, keyed by
-session id, never written to the session transcript or to a JSON file. The screenshot
-is the only artifact on disk.
+**Where it lives.** For a hotkey capture the packet text (title, URL, selection, tree) is
+held **in memory in the companion process** and served over its bearer-authenticated
+port. Disk gets only a metadata marker,
+`<HERMES_HOME>/plugin-data/look-at-this/pending.json`, containing exactly the packet id,
+session id and expiry — no content — plus the PNG at
+`plugin-data/look-at-this/shots/lat_<id>.png`. If the gateway is remote it fetches the
+packet over the authenticated companion port; when it takes the packet for a turn it
+writes its own PNG copy, so a remote preview may have no thumbnail. For `/look` captures
+the packet is held in memory in the gateway process, keyed by session id; it does not
+enter the session transcript or a JSON file.
 
 **How long.** The packet binding expires after `ttl_seconds` (default 300) and is
-consumed by one turn. The PNG is deleted when the packet expires (a sweep runs on the
-next capture), on `/look clear`, or when a new capture replaces it. Files older than
-TTL+60 s are swept opportunistically.
+consumed by one turn. The marker is deleted at expiry, on `/look clear`, or when the
+packet is taken. The PNG is deleted at TTL, on clear, or when a new capture replaces it; a
+sweep of files older than TTL+60 s runs on the next capture.
 
 **Who can read it.** Any process running as your OS user can read
-`plugin-data/look-at-this/`; the packet in memory is readable by the Hermes gateway
-process and by anything that can attach to it. There is no encryption at rest.
+`plugin-data/look-at-this/` — the PNG and the marker's id/session/expiry metadata. The
+packet text is readable by the companion process (and, for `/look` captures, the Hermes
+gateway process) and by anything that can attach to it or present the companion token.
+There is no encryption at rest.
 
 **What leaves the machine.** The packet **text** is sent to the model provider you
 configured for that turn, as part of your message. The screenshot is **not** uploaded
 unless the model calls `vision_analyze` on the path, in which case that image goes to
-the configured vision model. The plugin itself makes **no network calls** and has no
-telemetry. Redaction is text-only — the PNG is not altered, so a secret visible on
-screen is still visible in the image; that is why the exclude-list exists and why the
-chip shows you the thumbnail before you send.
+the configured vision model. With a remote gateway the packet also crosses the LAN or
+Tailscale link to the configured companion; that hop is bearer-authenticated, and
+cleartext HTTP is refused unless the address is loopback or private. Apart from that hop,
+the plugin makes **no network calls** and has no telemetry.
+
+Redaction is text-only — the PNG is not altered, so a secret visible on screen is still
+visible in the image; that is why the exclude-list exists and why the chip shows you the
+thumbnail before you send.
 
 **Exclude-list.** Process names (`1password.exe`, `bitwarden.exe`, `keepass*.exe`,
 `lastpass.exe`, `dashlane.exe`, `nordpass.exe`, `enpass.exe`, `keeper.exe`) and title
@@ -177,7 +202,7 @@ the attach entry and the chip (or quit the app). Close the companion if you ran 
 | **macOS** | AX tree + ScreenCaptureKit (cua-driver) | Needs **Screen Recording** and **Accessibility** TCC grants: `hermes computer-use doctor`. Reset with `tccutil reset ScreenCapture com.nousresearch.hermes` / `tccutil reset Accessibility com.nousresearch.hermes`. |
 | **Linux X11** | AT-SPI + X11 capture (cua-driver) | Needs AT-SPI running (GNOME/KDE/Xfce usually do). Clipboard fallback reads through the driver, not `xclip` directly. |
 | **Linux Wayland** | AT-SPI tree works; capture depends on the compositor | Native Wayland restricts screen capture and global hotkeys (core bug #82654). Use the XWayland bridge or the companion on an X11 session. |
-| **Remote / SSH / Docker gateway** | **Companion** (`companion/lat_companion.py`) | The gateway cannot see your screen. Run the companion on your machine; set `capture_backend=companion` and `companion_url`. It must be reachable from the gateway (LAN/Tailscale). Cleartext HTTP is refused unless the host is loopback/private. |
+| **Remote / SSH / Docker gateway** | **Companion** (`companion/lat_companion.py`) | The gateway cannot see your screen. Run the companion on your machine; set `capture_backend=companion` and `companion_url`. It must be reachable from the gateway (LAN/Tailscale). Cleartext HTTP is refused unless the host is loopback/private. The `--hotkey` flow also works: the gateway fetches the in-memory packet over the same authenticated port (`companion_token`, falling back to `plugin-data/look-at-this/companion.token`). A remote gateway may lack the local thumbnail path but keeps the per-field toggles. |
 
 ## Comparison
 
@@ -191,16 +216,17 @@ the attach entry and the chip (or quit the app). Close the companion if you ran 
 | `SkyLaTry/hermes-screen-awareness` | continuous whole-monitor capture | continuous, whole monitor, gateway machine's display |
 | `wechat-social-assistant` | one app, persistent memory | WeChat only, SQLite history |
 | `peripheral` (open catalog PR) | screen memory + OCR recall | continuous/recall-oriented, agent-driven |
-| **look-at-this** | **one-shot, any app, all surfaces, structured packet** | user-initiated; screenshot + tree + URL + selection + title; preview; TTL; consumed on read |
+| **look-at-this** | **one-shot, any app, all surfaces, structured packet** | user-initiated; screenshot + tree + URL + selection + title; preview; TTL; consumed by one turn |
 
 ## Limitations (read before filing a bug)
 
 1. **The global hotkey lives in the companion.** The Desktop plugin SDK has no global
    shortcut door, and the renderer cannot capture a native window, so the system-wide
-   chord is owned by `companion/lat_companion.py` (`--hotkey`), which captures and then
-   opens Hermes' Quick Entry popup. The in-app keybind remains for when Hermes is
-   already focused. Windows today; macOS/Linux need their own hotkey registration
-   (the capture half already runs there).
+   chord is owned by `companion/lat_companion.py` (`--hotkey`, Windows today). The
+   companion must be running: it holds the packet in memory, and the gateway fetches it
+   over the authenticated port on the next turn. Without the companion, use the in-app
+   keybind (Hermes focused) or `/look`. macOS/Linux have capture but no global hotkey
+   registration yet.
 2. **The desktop half is opt-in.** A unified package's UI half inventories disabled;
    toggle it on once.
 3. **The gateway captures, not necessarily your laptop.** `/look` runs in the gateway
@@ -221,7 +247,7 @@ Settings → Plugins.
 |---|---|---|
 | `ttl_seconds` | `300` | Packet lifetime |
 | `global_hotkey` | `ctrl+alt+l` | chord the companion registers system-wide (Windows) |
-| `quick_entry_hotkey` | `ctrl+shift+space` | chord that opens Hermes Quick Entry; must match the Desktop |
+| `quick_entry_hotkey` | `ctrl+shift+space` | chord the companion synthesizes to open Quick Entry; must match Settings → Keyboard Shortcuts → Quick Entry (use `--no-open` if disabled/rebound) |
 | `excluded_apps` | password managers | process names never captured |
 | `excluded_title_patterns` | incognito/private/password/vault/unlock | regexes matched against the title |
 | `clipboard_fallback` | `false` | use clipboard text when UIA reports no selection |
@@ -244,14 +270,16 @@ hermes config set plugins.entries.look-at-this.settings.companion_url http://192
 # then save the token as the secret setting (Settings → Plugins → companion_token)
 ```
 
-The companion never dials out, stores no history, and keeps the screenshot only long
-enough to base64 it back. The token is generated into
-`<HERMES_HOME>/plugin-data/look-at-this/companion.token` (0600) on first run.
+The companion never dials out and stores no history. `/capture` deletes its temporary PNG
+after base64-encoding it; `--hotkey` keeps the PNG (and the metadata marker) until TTL,
+`/look clear`, or the next capture. The token is generated into
+`<HERMES_HOME>/plugin-data/look-at-this/companion.token` (0600) on first run; a gateway
+with no `companion_token` setting reads that file.
 
 ## Development
 
 ```bash
-python -m unittest discover -s tests -v      # 23 unit tests, no driver needed
+python -m unittest discover -s tests -v      # 49 unit tests, no driver needed
 hermes plugins validate . --install-deps     # catalog gate
 hermes plugins doctor .                      # real register(ctx) probe
 ```
@@ -266,7 +294,9 @@ tools.py / hooks.py      tool handlers, pre_llm_call
 schemas.py               JSON schemas
 dashboard/plugin_api.py  gateway routes used by the desktop half
 desktop/plugin.js        SDK-only UI half (attach menu, keybind, preview chip)
-companion/               local capture service for remote gateways
+companion/lat_companion.py  capture service, --hotkey, packet endpoints
+companion/win_hotkey.py     Windows RegisterHotKey binding
 skills/look-at-this/     bundled workflow skill
+assets/                  catalog image (look-at-this.png)
 tests/                   unit tests
 ```

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import json
 import re
 import sys
 import time
@@ -13,6 +15,14 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import lat_core  # noqa: E402
+from companion import win_hotkey  # noqa: E402
+from companion.lat_companion import PendingBox  # noqa: E402
+
+# A real 1x1 transparent PNG, used by the companion /take tests.
+PNG_1X1_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGA"
+    "hKmMIQAAAABJRU5ErkJggg=="
+)
 
 
 def window(app="chrome.exe", title="Example — Chrome", z=5, pid=100, width=1200, height=800,
@@ -210,30 +220,7 @@ class CompanionTests(unittest.TestCase):
         self.assertFalse(lat_core._plain_http_allowed("ftp://127.0.0.1"))
 
 
-class SpoolTests(unittest.TestCase):
-    def setUp(self):
-        for path in lat_core.spool_dir().glob("*.json"):
-            path.unlink(missing_ok=True)
-
-    def test_roundtrip_is_single_use(self):
-        pkt = packet(session_id="", id="spool1")
-        lat_core.spool_packet(pkt)
-        got = lat_core.take_spooled()
-        self.assertIsNotNone(got)
-        self.assertEqual(got.id, "spool1")
-        self.assertEqual(got.app, "chrome.exe")
-        self.assertIsNone(lat_core.take_spooled())
-
-    def test_expired_spool_is_dropped(self):
-        lat_core.spool_packet(packet(session_id="", expires_at=time.time() - 1))
-        self.assertIsNone(lat_core.take_spooled())
-
-    def test_new_capture_replaces_the_previous_spool(self):
-        lat_core.spool_packet(packet(session_id="", id="first"))
-        lat_core.spool_packet(packet(session_id="", id="second"))
-        self.assertEqual(len(list(lat_core.spool_dir().glob("*.json"))), 1)
-        self.assertEqual(lat_core.take_spooled().id, "second")
-
+class PacketDictTests(unittest.TestCase):
     def test_from_dict_rejects_another_schema(self):
         with self.assertRaises(ValueError):
             lat_core.Packet.from_dict({"schema": "something-else"})
@@ -245,28 +232,228 @@ class SpoolTests(unittest.TestCase):
         self.assertIsNone(pkt.screenshot_path)
 
 
-class CompanionChordTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "lat_companion_under_test", ROOT / "companion" / "lat_companion.py")
-        cls.mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cls.mod)
+class MarkerTests(unittest.TestCase):
+    """The disk marker must never carry captured text — only routing metadata."""
 
+    def setUp(self):
+        lat_core.clear_pending_marker()
+        lat_core.active_session_path().unlink(missing_ok=True)
+
+    def tearDown(self):
+        lat_core.clear_pending_marker()
+        lat_core.active_session_path().unlink(missing_ok=True)
+
+    def test_marker_contains_only_routing_metadata(self):
+        pkt = packet(id="mark1", session_id="s1")
+        lat_core.write_pending_marker(pkt)
+        raw = lat_core.pending_marker_path().read_text(encoding="utf-8")
+        data = json.loads(raw)
+        self.assertIsInstance(data, dict)
+        self.assertEqual(set(data), {"id", "session_id", "expires_at"})
+        self.assertEqual(data["id"], "mark1")
+        self.assertEqual(data["session_id"], "s1")
+        self.assertEqual(data["expires_at"], pkt.expires_at)
+        for leaked in ("title", "url", "selection", "tree_markdown", "screenshot_path",
+                       "app", "pid", "fields", "redactions"):
+            self.assertNotIn(leaked, data)
+        # Defense in depth: none of the captured text appears in the raw file.
+        for secret in (pkt.title, pkt.url, pkt.selection, 'Text "hello"'):
+            self.assertNotIn(secret, raw)
+
+    def test_read_returns_the_marker_while_valid(self):
+        lat_core.write_pending_marker(packet(id="mark2"))
+        data = lat_core.read_pending_marker()
+        self.assertIsNotNone(data)
+        self.assertEqual(data["id"], "mark2")
+        self.assertTrue(lat_core.pending_marker_path().exists())
+
+    def test_expired_marker_returns_none_and_is_deleted(self):
+        lat_core.write_pending_marker(packet(expires_at=time.time() - 1))
+        path = lat_core.pending_marker_path()
+        self.assertTrue(path.exists())
+        self.assertIsNone(lat_core.read_pending_marker())
+        self.assertFalse(path.exists())
+
+    def test_malformed_marker_returns_none_and_is_deleted(self):
+        path = lat_core.pending_marker_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json", encoding="utf-8")
+        self.assertIsNone(lat_core.read_pending_marker())
+        self.assertFalse(path.exists())
+
+    def test_clear_pending_marker_removes_it(self):
+        path = lat_core.pending_marker_path()
+        lat_core.write_pending_marker(packet())
+        self.assertTrue(path.exists())
+        lat_core.clear_pending_marker()
+        self.assertFalse(path.exists())
+        self.assertIsNone(lat_core.read_pending_marker())
+
+    def test_active_session_roundtrip_and_clear(self):
+        path = lat_core.active_session_path()
+        lat_core.write_active_session("s1")
+        self.assertEqual(lat_core.read_active_session(), "s1")
+        lat_core.write_active_session("")
+        self.assertFalse(path.exists())
+        self.assertEqual(lat_core.read_active_session(), "")
+
+
+class CompanionApiTests(unittest.TestCase):
+    def setUp(self):
+        lat_core.STORE._by_session.clear()
+        lat_core.clear_pending_marker()
+
+    def tearDown(self):
+        lat_core.STORE._by_session.clear()
+        lat_core.clear_pending_marker()
+
+    def test_pending_packet_prefers_the_local_store(self):
+        lat_core.STORE.put(packet())
+        cfg = lat_core.Settings()
+        with mock.patch.object(lat_core, "companion_pending") as pending:
+            got = lat_core.pending_packet("s1", settings=cfg)
+        self.assertIsNotNone(got)
+        self.assertEqual(got.id, "abc123")
+        pending.assert_not_called()
+
+    def test_pending_packet_falls_back_to_the_companion(self):
+        remote = packet(id="remote")
+        cfg = lat_core.Settings()
+        with mock.patch.object(lat_core, "companion_pending", return_value=remote) as pending:
+            got = lat_core.pending_packet("s1", settings=cfg)
+        self.assertIs(got, remote)
+        pending.assert_called_once_with(cfg, "s1")
+
+    def test_companion_take_writes_the_png_and_clears_the_marker(self):
+        pkt = packet(id="take1")
+        lat_core.write_pending_marker(pkt)
+        self.assertTrue(lat_core.pending_marker_path().exists())
+        payload = {
+            "ok": True,
+            "packet": pkt.to_dict(),
+            "screenshot_b64": PNG_1X1_B64,
+        }
+        with mock.patch.object(lat_core, "companion_request", return_value=payload):
+            got = lat_core.companion_take(lat_core.Settings(), "s1")
+        self.assertIsNotNone(got)
+        self.assertEqual(got.id, "take1")
+        expected = lat_core.shots_dir() / "lat_take1.png"
+        try:
+            self.assertEqual(Path(got.screenshot_path), expected)
+            self.assertEqual(expected.read_bytes(), base64.b64decode(PNG_1X1_B64))
+        finally:
+            expected.unlink(missing_ok=True)
+        self.assertFalse(lat_core.pending_marker_path().exists())
+
+    def test_update_pending_fields_falls_through_to_the_companion(self):
+        updated = packet(fields=["url"])
+        cfg = lat_core.Settings()
+        with mock.patch.object(lat_core, "companion_update_fields", return_value=updated) as upd:
+            got = lat_core.update_pending_fields("s1", ["url"], settings=cfg)
+        self.assertIs(got, updated)
+        upd.assert_called_once_with(cfg, "s1", ["url"])
+
+    def test_clear_pending_reports_the_companion_clear(self):
+        cfg = lat_core.Settings()
+        with mock.patch.object(lat_core, "companion_clear", return_value=True) as cleared:
+            self.assertTrue(lat_core.clear_pending("s1", settings=cfg))
+        cleared.assert_called_once_with(cfg, "s1")
+
+
+class PendingBoxTests(unittest.TestCase):
+    """The companion's in-memory single-packet box (no disk text, PNG to TTL)."""
+
+    def _png(self, name: str) -> str:
+        path = lat_core.shots_dir() / name
+        path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"0" * 16)
+        self.addCleanup(path.unlink, missing_ok=True)
+        return str(path)
+
+    def test_put_get_take_is_single_use(self):
+        box = PendingBox()
+        box.put(packet(id="one"))
+        self.assertFalse(box.is_empty())
+        self.assertEqual(box.get("s1").id, "one")
+        self.assertEqual(box.take("s1").id, "one")
+        self.assertIsNone(box.take("s1"))
+        self.assertIsNone(box.get("s1"))
+        self.assertTrue(box.is_empty())
+
+    def test_session_binding(self):
+        box = PendingBox()
+        box.put(packet(session_id="s1"))
+        self.assertIsNone(box.get(""))
+        self.assertIsNone(box.get("s2"))
+        self.assertIsNone(box.take(""))
+        self.assertEqual(box.get("s1").id, "abc123")
+
+        box.take("s1")
+        box.put(packet(id="unbound", session_id=""))
+        self.assertEqual(box.get("anything").id, "unbound")
+        self.assertEqual(box.take("whatever").id, "unbound")
+
+    def test_expired_packet_is_dropped(self):
+        shot = self._png("lat_box_expired_get.png")
+        box = PendingBox()
+        box.put(packet(expires_at=time.time() - 1, screenshot_path=shot))
+        self.assertIsNone(box.get("s1"))
+        self.assertTrue(box.is_empty())
+        self.assertFalse(Path(shot).exists())
+
+        shot2 = self._png("lat_box_expired_take.png")
+        box.put(packet(expires_at=time.time() - 1, screenshot_path=shot2))
+        self.assertIsNone(box.take("s1"))
+        self.assertTrue(box.is_empty())
+        self.assertFalse(Path(shot2).exists())
+
+    def test_replacement_returns_the_new_packet_and_deletes_the_old_png(self):
+        shot = self._png("lat_box_first.png")
+        box = PendingBox()
+        box.put(packet(id="first", screenshot_path=shot))
+        box.put(packet(id="second"))
+        self.assertEqual(box.get("s1").id, "second")
+        self.assertFalse(Path(shot).exists())
+
+    def test_update_fields_filters_and_drops_the_png(self):
+        shot = self._png("lat_box_fields.png")
+        box = PendingBox()
+        box.put(packet(screenshot_path=shot))
+        got = box.update_fields("s1", ["url", "not-a-field"])
+        self.assertIsNotNone(got)
+        self.assertEqual(got.fields, ["url"])
+        self.assertIsNone(got.screenshot_path)
+        self.assertFalse(Path(shot).exists())
+        self.assertIsNone(box.update_fields("s2", ["url"]))
+        self.assertIsNone(box.update_fields("", ["url"]))
+
+    def test_clear_deletes_the_png_and_reports_once(self):
+        shot = self._png("lat_box_clear.png")
+        box = PendingBox()
+        box.put(packet(screenshot_path=shot))
+        self.assertTrue(box.clear("s1"))
+        self.assertFalse(Path(shot).exists())
+        self.assertFalse(box.clear("s1"))
+
+
+class CompanionChordTests(unittest.TestCase):
     def test_ctrl_alt_letter(self):
-        mods, vk = self.mod.parse_chord("ctrl+alt+l")
+        mods, vk = win_hotkey.parse_chord("ctrl+alt+l")
         self.assertEqual(mods, 0x0002 | 0x0001)
         self.assertEqual(vk, ord("L"))
 
     def test_space(self):
-        mods, vk = self.mod.parse_chord("ctrl+shift+space")
+        mods, vk = win_hotkey.parse_chord("ctrl+shift+space")
         self.assertEqual(mods, 0x0002 | 0x0004)
         self.assertEqual(vk, 0x20)
 
+    def test_function_key(self):
+        mods, vk = win_hotkey.parse_chord("f5")
+        self.assertEqual(mods, 0)
+        self.assertEqual(vk, 0x74)
+
     def test_bad_chord(self):
         with self.assertRaises(ValueError):
-            self.mod.parse_chord("hyper+l")
+            win_hotkey.parse_chord("hyper+l")
 
 
 class ManifestTests(unittest.TestCase):

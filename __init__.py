@@ -46,13 +46,13 @@ def _look(raw_args: str, session_id: str = "", platform: str = "", **kwargs) -> 
         return _HELP
 
     if parsed["cmd"] == "status":
-        pkt = lat_core.STORE.get(session_id) if session_id else None
+        pkt = lat_core.pending_packet(session_id)
         if pkt is None:
             return "Look At This: nothing pending. /look captures the current window."
         return lat_core.preview_text(pkt)
 
     if parsed["cmd"] == "clear":
-        cleared = lat_core.STORE.clear(session_id) if session_id else False
+        cleared = lat_core.clear_pending(session_id)
         return "Look At This: pending packet discarded." if cleared else "Look At This: nothing to discard."
 
     try:

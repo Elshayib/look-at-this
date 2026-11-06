@@ -86,7 +86,10 @@ function PendingChip() {
 
   const pending = useQuery({
     queryKey: ['look-at-this', 'pending', sessionId || 'next'],
-    queryFn: () => rest(`/pending?session_id=${encodeURIComponent(sessionId || '')}&preview=1`),
+    queryFn: async () => {
+      await rest('/active-session', { method: 'POST', body: { session_id: sessionId || '' } }).catch(() => {})
+      return rest(`/pending?session_id=${encodeURIComponent(sessionId || '')}&preview=1`)
+    },
     enabled: true,
     refetchInterval: 5000,
     staleTime: 1000,

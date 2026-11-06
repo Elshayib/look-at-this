@@ -6,14 +6,17 @@ imports. The plugin package imports it as ``.lat_core`` and registers the loaded
 module under ``hermes_look_at_this_core`` so the API half shares one packet
 store with the agent half.
 
-Nothing here talks to a model, the network, or Hermes internals beyond
-``hermes_constants.get_hermes_home`` (documented as public) and the local
-``cua-driver`` binary Hermes already ships for computer_use.
+Nothing here talks to a model or to Hermes internals beyond
+``hermes_constants.get_hermes_home`` (documented as public), the local
+``cua-driver`` binary Hermes already ships for computer_use, and the user-run
+capture companion's authenticated HTTP endpoint (loopback/private by default).
 """
 
 from __future__ import annotations
 
+import base64
 import ctypes
+import dataclasses
 import json
 import os
 import queue
@@ -23,11 +26,14 @@ import subprocess
 import sys
 import threading
 import time
+import types
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Union, get_args, get_origin, get_type_hints
 
 SCHEMA = "look-at-this/packet@1"
 DEFAULT_TTL = 300
@@ -105,6 +111,8 @@ class Settings:
     capture_backend: str = "auto"          # auto | local | companion
     companion_url: str = "http://127.0.0.1:7391"
     companion_token: str = ""
+    global_hotkey: str = "ctrl+alt+l"
+    quick_entry_hotkey: str = "ctrl+shift+space"
 
     @classmethod
     def from_getter(cls, get) -> "Settings":
@@ -131,7 +139,32 @@ class Settings:
             capture_backend=backend,
             companion_url=str(_get("companion_url", "http://127.0.0.1:7391")).strip().rstrip("/"),
             companion_token=str(_get("companion_token", "") or "").strip(),
+            global_hotkey=str(_get("global_hotkey", "ctrl+alt+l") or "ctrl+alt+l").strip(),
+            quick_entry_hotkey=str(_get("quick_entry_hotkey", "ctrl+shift+space") or "ctrl+shift+space").strip(),
         )
+
+
+def load_settings() -> tuple[Settings, dict]:
+    """Live plugin settings, read the way the API half reads them.
+
+    Never raises: a malformed config or a missing ``hermes_cli`` becomes the
+    schema defaults. The raw settings dict is returned so callers can tell
+    "not configured" from "configured to the default".
+    """
+    data: dict[str, Any] = {}
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+        entry = (((cfg.get("plugins") or {}).get("entries") or {}).get("look-at-this") or {})
+        raw = entry.get("settings") or {}
+        if isinstance(raw, dict):
+            data = raw
+    except Exception:
+        data = {}
+    try:
+        return Settings.from_getter(lambda key, default=None: data.get(key, default)), data
+    except Exception:
+        return Settings(), {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -161,10 +194,6 @@ class CaptureFailed(LookAtError):
 
 class ExcludedWindow(LookAtError):
     code = "excluded_window"
-
-
-class NoSession(LookAtError):
-    code = "no_session"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -465,6 +494,14 @@ def exclusion_rule(w: dict, settings: Settings) -> str | None:
     return None
 
 
+def _locked_error() -> CaptureFailed:
+    """The one refusal for a locked desktop, whatever path found the lock."""
+    return CaptureFailed(
+        "The screen is locked, so nothing was captured.",
+        detail="Unlock the desktop and try again.",
+    )
+
+
 def pick_target(windows: list[dict], settings: Settings, hint: str = "") -> dict:
     """The window the user means.
 
@@ -496,18 +533,12 @@ def pick_target(windows: list[dict], settings: Settings, hint: str = "") -> dict
     fg = foreground_hwnd()
     if fg is not None:
         if "lock screen" in hwnd_title(fg).lower():
-            raise CaptureFailed(
-                "The screen is locked, so nothing was captured.",
-                detail="Unlock the desktop and try again.",
-            )
+            raise _locked_error()
         for w in pool:
             try:
                 if int(w.get("window_id")) == fg:
                     if _is_lock_screen(w):
-                        raise CaptureFailed(
-                            "The screen is locked, so nothing was captured.",
-                            detail="Unlock the desktop and try again.",
-                        )
+                        raise _locked_error()
                     rule = exclusion_rule(w, settings)
                     if rule:
                         raise ExcludedWindow(
@@ -525,10 +556,7 @@ def pick_target(windows: list[dict], settings: Settings, hint: str = "") -> dict
     # window behind it.
     tops = sorted([w for w in pool if w.get("is_on_screen")], key=_z, reverse=True)
     if tops and _is_lock_screen(tops[0]):
-        raise CaptureFailed(
-            "The screen is locked, so nothing was captured.",
-            detail="Unlock the desktop and try again.",
-        )
+        raise _locked_error()
 
     candidates = [w for w in pool if _eligible(w)]
     if not candidates:
@@ -1028,66 +1056,169 @@ class Packet:
         return out
 
     def to_dict(self) -> dict[str, Any]:
-        """Serializable form used by the companion spool (no image bytes)."""
-        return {
-            "schema": SCHEMA,
-            "id": self.id,
-            "session_id": self.session_id,
-            "created_at": self.created_at,
-            "expires_at": self.expires_at,
-            "app": self.app,
-            "pid": self.pid,
-            "window_id": self.window_id,
-            "title": self.title,
-            "url": self.url,
-            "url_source": self.url_source,
-            "selection": self.selection,
-            "selection_source": self.selection_source,
-            "screenshot_path": self.screenshot_path,
-            "screenshot_width": self.screenshot_width,
-            "screenshot_height": self.screenshot_height,
-            "tree_markdown": self.tree_markdown,
-            "element_count": self.element_count,
-            "returned_count": self.returned_count,
-            "truncated": self.truncated,
-            "fields": list(self.fields),
-            "redactions": dict(self.redactions),
-        }
+        """Serializable form (no image bytes), built from the dataclass fields."""
+        out: dict[str, Any] = {"schema": SCHEMA}
+        for f in dataclasses.fields(self):
+            value = getattr(self, f.name)
+            if isinstance(value, list):
+                value = list(value)
+            elif isinstance(value, dict):
+                value = dict(value)
+            out[f.name] = value
+        return out
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Packet":
         if not isinstance(data, dict) or data.get("schema") != SCHEMA:
             raise ValueError("not a look-at-this packet")
-        shot = data.get("screenshot_path")
+        hints = _packet_hints()
+        values = _packet_defaults()
+        for f in dataclasses.fields(cls):
+            if f.name in data:
+                values[f.name] = _coerce_field(data[f.name], hints.get(f.name, str))
+        shot = values.get("screenshot_path")
         if shot:
             try:
                 Path(shot).resolve().relative_to(data_dir().resolve())
             except (OSError, ValueError):
-                shot = None  # never trust a path outside our own data dir
-        fields = [f for f in data.get("fields") or ALL_FIELDS if f in ALL_FIELDS]
-        return cls(
-            id=str(data.get("id") or uuid.uuid4().hex[:12]),
-            session_id=str(data.get("session_id") or ""),
-            created_at=float(data.get("created_at") or time.time()),
-            expires_at=float(data.get("expires_at") or time.time() + DEFAULT_TTL),
-            app=str(data.get("app") or "unknown"),
-            pid=int(data.get("pid") or 0),
-            window_id=data.get("window_id"),
-            title=str(data.get("title") or ""),
-            url=data.get("url"),
-            url_source=data.get("url_source"),
-            selection=data.get("selection"),
-            selection_source=data.get("selection_source"),
-            screenshot_path=shot,
-            screenshot_width=data.get("screenshot_width"),
-            screenshot_height=data.get("screenshot_height"),
-            tree_markdown=str(data.get("tree_markdown") or ""),
-            element_count=int(data.get("element_count") or 0),
-            returned_count=int(data.get("returned_count") or 0),
-            truncated=bool(data.get("truncated")),
-            fields=fields,
-            redactions={str(k): int(v) for k, v in (data.get("redactions") or {}).items()},
-        )
+                values["screenshot_path"] = None  # never trust a path outside our own data dir
+        if not values.get("id"):
+            values["id"] = uuid.uuid4().hex[:12]
+        if not values.get("app"):
+            values["app"] = "unknown"
+        values["fields"] = [f for f in values.get("fields") or ALL_FIELDS if f in ALL_FIELDS]
+        values["redactions"] = {str(k): int(v) for k, v in (values.get("redactions") or {}).items()}
+        return cls(**values)
+
+
+_PACKET_HINTS: dict[str, Any] | None = None
+
+
+def _packet_hints() -> dict[str, Any]:
+    """Resolved annotations for Packet (``from __future__`` makes them strings)."""
+    global _PACKET_HINTS
+    if _PACKET_HINTS is None:
+        _PACKET_HINTS = get_type_hints(Packet)
+    return _PACKET_HINTS
+
+
+def _union_args(tp: Any) -> tuple:
+    origin = get_origin(tp)
+    if origin is Union or origin is getattr(types, "UnionType", None):
+        return get_args(tp)
+    return ()
+
+
+def _field_kind(tp: Any) -> str:
+    """The concrete kind a declared type coerces to; unions prefer non-None."""
+    args = _union_args(tp)
+    if args:
+        for arg in args:
+            if arg is type(None):
+                continue
+            kind = _field_kind(arg)
+            if kind:
+                return kind
+        return "none"
+    if tp is str:
+        return "str"
+    if tp is bool:
+        return "bool"
+    if tp is int:
+        return "int"
+    if tp is float:
+        return "float"
+    if tp is list or get_origin(tp) is list:
+        return "list"
+    if tp is dict or get_origin(tp) is dict:
+        return "dict"
+    return "str"
+
+
+def _matches_kind(value: Any, tp: Any) -> bool:
+    kind = _field_kind(tp)
+    if kind == "str":
+        return isinstance(value, str)
+    if kind == "bool":
+        return isinstance(value, bool)
+    if kind == "int":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if kind == "float":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if kind == "list":
+        return isinstance(value, (list, tuple))
+    if kind == "dict":
+        return isinstance(value, dict)
+    return value is None
+
+
+def _coerce_kind(value: Any, kind: str) -> Any:
+    if kind == "str":
+        return "" if value is None else str(value)
+    if kind == "int":
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+    if kind == "float":
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+    if kind == "bool":
+        return bool(value)
+    if kind == "list":
+        return list(value) if isinstance(value, (list, tuple)) else []
+    if kind == "dict":
+        return dict(value) if isinstance(value, dict) else {}
+    return None
+
+
+def _coerce_field(value: Any, tp: Any) -> Any:
+    """Coerce one JSON value to its declared field type, keeping valid unions."""
+    args = _union_args(tp)
+    if args:
+        if value is None:
+            return None if type(None) in args else _coerce_kind(value, _field_kind(tp))
+        for arg in args:
+            if arg is not type(None) and _matches_kind(value, arg):
+                return value
+        return _coerce_kind(value, _field_kind(tp))
+    return _coerce_kind(value, _field_kind(tp))
+
+
+def _empty_for(tp: Any) -> Any:
+    if type(None) in _union_args(tp):
+        return None
+    kind = _field_kind(tp)
+    if kind == "str":
+        return ""
+    if kind == "int":
+        return 0
+    if kind == "float":
+        return 0.0
+    if kind == "bool":
+        return False
+    if kind == "list":
+        return []
+    if kind == "dict":
+        return {}
+    return None
+
+
+def _packet_defaults() -> dict[str, Any]:
+    """A complete, valid Packet kwargs dict for fields the payload omits."""
+    hints = _packet_hints()
+    now = time.time()
+    values = {f.name: _empty_for(hints.get(f.name, str)) for f in dataclasses.fields(Packet)}
+    values.update(
+        id=uuid.uuid4().hex[:12],
+        created_at=now,
+        expires_at=now + DEFAULT_TTL,
+        app="unknown",
+        fields=list(ALL_FIELDS),
+    )
+    return values
 
 
 def _clip(text: str | None, n: int) -> str | None:
@@ -1299,90 +1430,260 @@ STORE = _shared
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Spool: a packet written by the companion, read by the gateway on the next turn
+# Pending packet: the companion holds it in memory; disk gets metadata only
 # ─────────────────────────────────────────────────────────────────────────────
 
-def spool_dir() -> Path:
-    d = data_dir() / "spool"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def _spool_files() -> list[Path]:
+def _unlink_quiet(path: Path) -> None:
     try:
-        return sorted(spool_dir().glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        path.unlink(missing_ok=True)
     except OSError:
-        return []
+        pass
 
 
-def spool_packet(pkt: Packet) -> str:
-    """Atomically write one packet for the next turn. Newest wins, older ones go."""
-    d = spool_dir()
-    path = d / f"{pkt.id}.json"
-    tmp = d / f".{pkt.id}.tmp"
-    tmp.write_text(json.dumps(pkt.to_dict(), ensure_ascii=False), encoding="utf-8")
+def pending_marker_path() -> Path:
+    """Where the gateway looks to learn that a hotkey capture is waiting."""
+    return data_dir() / "pending.json"
+
+
+def write_pending_marker(pkt: Packet) -> None:
+    """Atomically record *which* session has a packet — id, session, expiry only.
+
+    The packet itself (title, URL, selection, tree, screenshot path) never
+    touches the disk: the companion keeps it in memory and serves it over its
+    authenticated endpoint.
+    """
+    path = pending_marker_path()
+    payload = {"id": pkt.id, "session_id": pkt.session_id, "expires_at": pkt.expires_at}
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, path)
-    for old in _spool_files():
-        if old == path:
-            continue
-        try:
-            prior = Packet.from_dict(json.loads(old.read_text(encoding="utf-8")))
-            if prior.screenshot_path and prior.screenshot_path != pkt.screenshot_path:
-                Path(prior.screenshot_path).unlink(missing_ok=True)
-        except (OSError, TypeError, ValueError):
-            pass
-        old.unlink(missing_ok=True)
-    return str(path)
 
 
-def take_spooled() -> Packet | None:
-    """Consume the newest valid spooled packet (single use)."""
-    now = time.time()
-    for path in _spool_files():
+def read_pending_marker() -> dict | None:
+    """The unexpired marker, or None. Expired/malformed markers are removed."""
+    path = pending_marker_path()
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise ValueError("marker is not an object")
+        expires = float(data.get("expires_at") or 0)
+    except (TypeError, ValueError):
+        _unlink_quiet(path)
+        return None
+    if expires <= time.time():
+        _unlink_quiet(path)
+        return None
+    return data
+
+
+def clear_pending_marker() -> None:
+    _unlink_quiet(pending_marker_path())
+
+
+def active_session_path() -> Path:
+    """The chat the Desktop last had focused, so a hotkey capture can bind to it."""
+    return data_dir() / "active-session"
+
+
+def read_active_session() -> str:
+    try:
+        return active_session_path().read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        return ""
+
+
+def write_active_session(session_id: str) -> None:
+    path = active_session_path()
+    value = str(session_id or "").strip()
+    if not value:
+        _unlink_quiet(path)
+        return
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(value, encoding="utf-8")
+    os.replace(tmp, path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Authenticated companion client (stdlib only)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _companion_token(settings: Settings) -> str:
+    token = str(settings.companion_token or "").strip()
+    if token:
+        return token
+    try:
+        return (data_dir() / "companion.token").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def companion_request(settings: Settings, method: str, path: str,
+                      payload: dict | None = None, timeout: float = 5.0) -> dict:
+    """One authenticated JSON request to the companion. Raises ``LookAtError``."""
+    base = str(settings.companion_url or "").rstrip("/")
+    if not base:
+        raise LookAtError("companion_url is not configured.")
+    url = base + path
+    if not _plain_http_allowed(url):
+        raise LookAtError(
+            f"Refusing cleartext HTTP to {base!r}: use https, or a loopback/private address."
+        )
+    body = None if payload is None else json.dumps(payload).encode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {_companion_token(settings)}",
+        "Content-Type": "application/json",
+    }
+    request = urllib.request.Request(
+        url, data=body, method=str(method or "GET").upper(), headers=headers,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            path.unlink(missing_ok=True)
-            continue
+            err = json.loads(exc.read().decode("utf-8"))
+        except Exception:
+            err = {}
+        message = str(err.get("error") or f"companion returned HTTP {exc.code}")
+        raise LookAtError(message) from exc
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        raise LookAtError(f"The companion at {base} is unreachable: {exc}") from exc
+    try:
+        data = json.loads(raw or "{}")
+    except ValueError as exc:
+        raise LookAtError("The companion returned invalid JSON.") from exc
+    if not isinstance(data, dict):
+        raise LookAtError("The companion returned an unexpected response.")
+    return data
+
+
+def companion_pending(settings: Settings, session_id: str, *, preview: bool = False) -> Packet | None:
+    """Ask the companion what it is holding for this session, without consuming it."""
+    from urllib.parse import quote
+
+    query = f"/pending?session_id={quote(str(session_id or ''), safe='')}&preview={1 if preview else 0}"
+    try:
+        payload = companion_request(settings, "GET", query)
+        pending = payload.get("packet")
+        if isinstance(pending, dict):
+            return Packet.from_dict(pending)
+    except (LookAtError, ValueError, TypeError):
+        return None
+    return None
+
+
+def _needs_local_screenshot(pkt: Packet) -> bool:
+    """True when pkt.screenshot_path is absent, unreadable, or outside our data dir."""
+    if not pkt.screenshot_path:
+        return True
+    try:
+        path = Path(pkt.screenshot_path)
+        path.resolve().relative_to(data_dir().resolve())
+    except (OSError, ValueError):
+        return True
+    return not path.is_file()
+
+
+def companion_take(settings: Settings, session_id: str) -> Packet | None:
+    """Consume the companion's pending packet for this session, writing its PNG locally."""
+    try:
+        payload = companion_request(settings, "POST", "/take", {"session_id": session_id})
+    except LookAtError:
+        return None
+    raw = payload.get("packet")
+    pkt: Packet | None = None
+    if isinstance(raw, dict):
         try:
-            pkt = Packet.from_dict(data)
-        except (TypeError, ValueError):
-            path.unlink(missing_ok=True)
-            continue
-        path.unlink(missing_ok=True)
-        if pkt.expires_at <= now:
-            if pkt.screenshot_path:
-                Path(pkt.screenshot_path).unlink(missing_ok=True)
-            continue
+            pkt = Packet.from_dict(raw)
+        except (ValueError, TypeError):
+            pkt = None
+    if pkt is None:
+        return None
+    shot_b64 = payload.get("screenshot_b64")
+    if isinstance(shot_b64, str) and shot_b64 and _needs_local_screenshot(pkt):
+        try:
+            raw_bytes = base64.b64decode(shot_b64, validate=False)
+        except (ValueError, TypeError):
+            raw_bytes = b""
+        if raw_bytes and len(raw_bytes) <= MAX_SCREENSHOT_BYTES:
+            try:
+                safe_id = re.sub(r"[^A-Za-z0-9_-]", "", pkt.id)[:64] or uuid.uuid4().hex[:12]
+                out = shots_dir() / f"lat_{safe_id}.png"
+                out.write_bytes(raw_bytes)
+                pkt.screenshot_path = str(out)
+            except OSError:
+                pkt.screenshot_path = None
+    clear_pending_marker()
+    return pkt
+
+
+def companion_update_fields(settings: Settings, session_id: str, fields: list[str]) -> Packet | None:
+    """Change which fields the pending packet exposes (e.g. drop the screenshot)."""
+    try:
+        payload = companion_request(
+            settings, "PATCH", "/pending",
+            {"session_id": session_id, "fields": list(fields)},
+        )
+        updated = payload.get("packet")
+        if isinstance(updated, dict):
+            return Packet.from_dict(updated)
+    except (LookAtError, ValueError, TypeError):
+        return None
+    return None
+
+
+def companion_clear(settings: Settings, session_id: str) -> bool:
+    try:
+        payload = companion_request(settings, "POST", "/clear", {"session_id": session_id})
+    except LookAtError:
+        return False
+    return bool(payload.get("cleared"))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Unified pending API: surfaces use these, never a backend directly
+# ─────────────────────────────────────────────────────────────────────────────
+
+def pending_packet(session_id: str, settings: Settings | None = None) -> Packet | None:
+    """The pending packet for this session: local store first, then companion."""
+    pkt = STORE.get(session_id)
+    if pkt is not None:
         return pkt
-    return None
+    try:
+        if settings is None:
+            settings = load_settings()[0]
+        return companion_pending(settings, session_id)
+    except Exception:
+        return None
 
 
-def spooled_info() -> dict[str, Any] | None:
-    for path in _spool_files():
-        try:
-            pkt = Packet.from_dict(json.loads(path.read_text(encoding="utf-8")))
-        except (OSError, TypeError, ValueError):
-            continue
-        if pkt.expires_at <= time.time():
-            continue
-        return pkt.public()
-    return None
+def update_pending_fields(session_id: str, fields: list[str],
+                          settings: Settings | None = None) -> Packet | None:
+    pkt = STORE.update_fields(session_id, fields)
+    if pkt is not None:
+        return pkt
+    try:
+        if settings is None:
+            settings = load_settings()[0]
+        return companion_update_fields(settings, session_id, fields)
+    except Exception:
+        return None
 
 
-def clear_spooled() -> bool:
-    cleared = False
-    for path in _spool_files():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            pkt = Packet.from_dict(data)
-            if pkt.screenshot_path:
-                Path(pkt.screenshot_path).unlink(missing_ok=True)
-        except (OSError, TypeError, ValueError):
-            pass
-        path.unlink(missing_ok=True)
-        cleared = True
-    return cleared
+def clear_pending(session_id: str, settings: Settings | None = None) -> bool:
+    cleared = STORE.clear(session_id)
+    companion_cleared = False
+    try:
+        if settings is None:
+            settings = load_settings()[0]
+        companion_cleared = companion_clear(settings, session_id)
+    except Exception:
+        companion_cleared = False
+    return companion_cleared or cleared
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1393,8 +1694,10 @@ def grab_for_turn(settings: Settings, session_id: str, *, hint: str = "",
                   fields: list[str] | None = None) -> tuple[Packet, str]:
     """Capture, store for the next turn, and return the preview block for the user.
 
-    An empty ``session_id`` (a brand-new chat that has no id yet) is stored in
-    the unbound slot and consumed by the next turn of any session in the profile.
+    The packet is bound to the focused session when one is known; a brand-new
+    chat with no id yet falls back to the unbound slot, consumed by the next
+    turn of any session in the profile. Global-hotkey packets are held in the
+    companion's memory, not written to disk — only a metadata marker is.
     """
     STORE.sweep_files(settings.ttl_seconds)
     cap = capture(settings, hint=hint)

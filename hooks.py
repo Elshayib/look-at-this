@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import logging
 
-from . import lat_core
+if __package__:  # normal plugin load: hooks is a module in the plugin package
+    from . import lat_core
+else:  # direct import for smoke checks, e.g. `python -c "import lat_core, hooks"`
+    import lat_core  # type: ignore[no-redef]
 
 logger = logging.getLogger(__name__)
 
@@ -15,9 +18,12 @@ def pre_llm_call(session_id: str = "", **kwargs):
     try:
         pkt = lat_core.STORE.consume(session_id)
         if pkt is None:
-            # A global-hotkey capture from the companion lands here: it has no
-            # session id, so the next turn in any session consumes it.
-            pkt = lat_core.take_spooled()
+            # A global-hotkey capture lives in the companion's memory, bound to
+            # the session the Desktop had focused. A remote gateway has no local
+            # marker, so the configured backend alone is enough to ask for it.
+            settings = lat_core.load_settings()[0]
+            if settings.capture_backend == "companion" or lat_core.read_pending_marker() is not None:
+                pkt = lat_core.companion_take(settings, session_id)
     except Exception:
         logger.exception("look-at-this: packet store failed")
         return None

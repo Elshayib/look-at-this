@@ -52,3 +52,6 @@ If the user asks about their screen and no packet is attached:
 - **Excluded windows fail closed.** Password managers, incognito windows and anything in
   the user's exclude list are refused before any screenshot is taken. A refusal is not a
   bug; do not try to work around it.
+- **A hotkey packet is bound to the chat that was focused when it was captured.** If the
+  user switches chats before sending, the packet will not follow them — ask them to
+  capture again in the chat they mean.

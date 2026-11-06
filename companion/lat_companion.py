@@ -1,15 +1,29 @@
 #!/usr/bin/env python3
 """Look At This — local capture companion.
 
-Runs on the machine whose screen you want to capture and serves one endpoint,
-``POST /capture``, so a Hermes gateway that is NOT on this machine (Docker, an
-SSH terminal backend, a home server) can still capture *your* window. The
-gateway calls in; this process never dials out.
+Runs on the machine whose screen you want to capture. A Hermes gateway that is
+NOT on this machine (Docker, an SSH terminal backend, a home server) can call
+``POST /capture`` instead of driving a local driver; the Desktop's global
+hotkey can also live here (``--hotkey``), capturing the window in front of you
+and then opening Quick Entry.
 
 What it does: resolves the driver exactly like the plugin, captures the
 foreground window (or the window beneath the last non-Hermes window), and
-returns the packet fields plus the PNG as base64. Nothing is stored here: no
-history, no queue, no disk copy beyond the driver's temporary screenshot.
+returns the packet fields plus the PNG as base64.
+
+Hotkey captures are held in this process's memory and served over the same
+authenticated port:
+
+    GET   /pending?session_id=...&preview=1   the packet, without consuming it
+    PATCH /pending                            change which fields it exposes
+    POST  /take                               consume it (PNG as base64)
+    POST  /clear                              discard it
+
+Only a metadata marker (packet id, session id, expiry) is written to
+``<HERMES_HOME>/plugin-data/look-at-this/pending.json`` and the PNG to
+``shots/``; the packet text (title, URL, selection, tree) never touches disk.
+The PNG is deleted when the packet expires, is cleared, or a newer capture
+replaces it. This process never dials out.
 
 Auth: a bearer token, generated on first run into
 ``<HERMES_HOME>/plugin-data/look-at-this/companion.token`` (mode 0600) unless
@@ -21,29 +35,34 @@ Usage:
     python companion/lat_companion.py                 # 127.0.0.1:7391
     python companion/lat_companion.py --host 0.0.0.0  # reachable on the LAN
     python companion/lat_companion.py --print-token   # show the token and exit
+    python companion/lat_companion.py --hotkey        # global hotkey + HTTP
+    python companion/lat_companion.py --install-autostart
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
-import ctypes
-import ctypes.wintypes
+import dataclasses
 import hmac
 import json
 import os
 import secrets
-import subprocess
 import sys
-import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import lat_core  # noqa: E402
+
+if __package__:  # imported as part of the package, e.g. `-m companion.lat_companion`
+    from . import win_hotkey  # noqa: E402
+else:  # run as a script: `python companion/lat_companion.py`
+    from companion import win_hotkey  # noqa: E402
 
 MAX_BODY = 16 * 1024
 DEFAULT_PORT = 7391
@@ -71,6 +90,148 @@ def load_or_create_token(explicit: str = "", explicit_file: str = "") -> str:
     return value
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Pending box: the one hotkey packet this process is holding, never on disk
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _unlink_png(path: str | None) -> None:
+    if not path:
+        return
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+class PendingBox:
+    """One packet at a time, TTL-bound, guarded by a lock.
+
+    A packet captured from a fresh chat has ``session_id == ""`` and may be
+    claimed by any request. A packet bound to a real session is claimable only
+    by that session — a blank request must never see it.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._packet: lat_core.Packet | None = None
+
+    @staticmethod
+    def _matches(pkt: lat_core.Packet, session_id: str) -> bool:
+        return pkt.session_id == "" or pkt.session_id == session_id
+
+    @staticmethod
+    def _expired(pkt: lat_core.Packet) -> bool:
+        return pkt.expires_at <= time.time()
+
+    def put(self, pkt: lat_core.Packet) -> lat_core.Packet:
+        """Replace the held packet; a superseded PNG is deleted."""
+        self.sweep()
+        with self._lock:
+            old = self._packet
+            self._packet = pkt
+        if old is not None and old.screenshot_path != pkt.screenshot_path:
+            _unlink_png(old.screenshot_path)
+        return pkt
+
+    def get(self, session_id: str) -> lat_core.Packet | None:
+        with self._lock:
+            pkt = self._packet
+            if pkt is None or not self._matches(pkt, session_id):
+                return None
+            if not self._expired(pkt):
+                return pkt
+            self._packet = None
+        lat_core.clear_pending_marker()
+        _unlink_png(pkt.screenshot_path)
+        return None
+
+    def take(self, session_id: str) -> lat_core.Packet | None:
+        """Remove and return the packet on a match. The PNG survives to TTL."""
+        stale_path = None
+        result = None
+        expired = False
+        with self._lock:
+            pkt = self._packet
+            if pkt is None or not self._matches(pkt, session_id):
+                return None
+            self._packet = None
+            if self._expired(pkt):
+                stale_path = pkt.screenshot_path
+                expired = True
+            else:
+                result = pkt
+        if expired:
+            lat_core.clear_pending_marker()
+        _unlink_png(stale_path)
+        return result
+
+    def update_fields(self, session_id: str, fields: list[str]) -> lat_core.Packet | None:
+        stale_path = None
+        result = None
+        expired = False
+        with self._lock:
+            pkt = self._packet
+            if pkt is None or not self._matches(pkt, session_id):
+                return None
+            if self._expired(pkt):
+                self._packet = None
+                stale_path = pkt.screenshot_path
+                expired = True
+            else:
+                pkt.fields = [f for f in fields if f in lat_core.ALL_FIELDS]
+                if "screenshot" not in pkt.fields and pkt.screenshot_path:
+                    stale_path = pkt.screenshot_path
+                    pkt.screenshot_path = None
+                result = pkt
+        if expired:
+            lat_core.clear_pending_marker()
+        _unlink_png(stale_path)
+        return result
+
+    def clear(self, session_id: str) -> bool:
+        with self._lock:
+            pkt = self._packet
+            if pkt is None or not self._matches(pkt, session_id):
+                return False
+            self._packet = None
+        _unlink_png(pkt.screenshot_path)
+        return True
+
+    def sweep(self) -> None:
+        with self._lock:
+            pkt = self._packet
+            if pkt is None or not self._expired(pkt):
+                return
+            self._packet = None
+        lat_core.clear_pending_marker()
+        _unlink_png(pkt.screenshot_path)
+
+    def is_empty(self) -> bool:
+        with self._lock:
+            return self._packet is None
+
+
+BOX = PendingBox()
+
+
+def _read_screenshot_b64(path: str | None) -> str | None:
+    if not path:
+        return None
+    try:
+        raw = Path(path).read_bytes()
+    except OSError:
+        return None
+    if not raw or len(raw) > lat_core.MAX_SCREENSHOT_BYTES:
+        return None
+    return base64.b64encode(raw).decode("ascii")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP: capture, plus the pending packet held in this process
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "LookAtThisCompanion/0.1"
     token = ""
@@ -81,12 +242,18 @@ class Handler(BaseHTTPRequestHandler):
         if os.environ.get("LAT_COMPANION_DEBUG"):
             super().log_message(fmt, *args)
 
+    def _target(self) -> tuple[str, dict[str, list[str]]]:
+        parts = urlsplit(self.path)
+        return (parts.path.rstrip("/") or "/"), parse_qs(parts.query, keep_blank_values=True)
+
     def _auth(self) -> bool:
         header = self.headers.get("Authorization", "")
         prefix = "Bearer "
         if not header.startswith(prefix):
             return False
-        return hmac.compare_digest(header[len(prefix):].strip(), self.token)
+        return hmac.compare_digest(
+            header[len(prefix):].strip().encode("utf-8"), self.token.encode("utf-8")
+        )
 
     def _json(self, status: int, payload: dict) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -97,46 +264,136 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_GET(self):  # noqa: N802
-        if self.path.rstrip("/") != "/health":
-            self._json(404, {"ok": False, "error": "not found"})
-            return
-        if not self._auth():
-            self._json(401, {"ok": False, "error": "unauthorized"})
-            return
-        self._json(200, {
-            "ok": True,
-            "version": "0.1.0",
-            "driver": lat_core.resolve_driver(),
-            "platform": sys.platform,
-        })
-
-    def do_POST(self):  # noqa: N802
-        if self.path.rstrip("/") != "/capture":
-            self._json(404, {"ok": False, "error": "not found"})
-            return
-        if not self._auth():
-            self._json(401, {"ok": False, "error": "unauthorized"})
-            return
+    def _read_json(self) -> dict | None:
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             length = 0
         if length <= 0 or length > MAX_BODY:
             self._json(400, {"ok": False, "error": "invalid body"})
-            return
+            return None
         try:
             payload = json.loads(self.rfile.read(length) or b"{}")
         except ValueError:
             self._json(400, {"ok": False, "error": "invalid json"})
+            return None
+        if not isinstance(payload, dict):
+            self._json(400, {"ok": False, "error": "invalid body"})
+            return None
+        return payload
+
+    # -- GET /health, GET /pending -----------------------------------------
+
+    def do_GET(self):  # noqa: N802
+        path, query = self._target()
+        if path not in ("/health", "/pending"):
+            self._json(404, {"ok": False, "error": "not found"})
+            return
+        if not self._auth():
+            self._json(401, {"ok": False, "error": "unauthorized"})
+            return
+        if path == "/health":
+            self._json(200, {
+                "ok": True,
+                "version": "0.1.0",
+                "driver": lat_core.resolve_driver(),
+                "platform": sys.platform,
+            })
+            return
+        session_id = (query.get("session_id") or [""])[0].strip()
+        preview = (query.get("preview") or ["0"])[0].strip().lower() in ("1", "true", "yes", "on")
+        pkt = BOX.get(session_id)
+        if pkt is None:
+            self._json(200, {"ok": True, "pending": None, "packet": None})
+            return
+        self._json(200, {
+            "ok": True,
+            "pending": pkt.public(include_preview=preview),
+            "packet": pkt.to_dict(),
+        })
+
+    # -- PATCH /pending ------------------------------------------------------
+
+    def do_PATCH(self):  # noqa: N802
+        path, _query = self._target()
+        if path != "/pending":
+            self._json(404, {"ok": False, "error": "not found"})
+            return
+        if not self._auth():
+            self._json(401, {"ok": False, "error": "unauthorized"})
+            return
+        payload = self._read_json()
+        if payload is None:
+            return
+        raw_fields = payload.get("fields")
+        fields = ([str(f) for f in raw_fields if str(f) in lat_core.ALL_FIELDS]
+                  if isinstance(raw_fields, list) else [])
+        if not fields:
+            self._json(400, {
+                "ok": False,
+                "error": "fields must name at least one of " + ", ".join(lat_core.ALL_FIELDS),
+            })
+            return
+        session_id = str(payload.get("session_id") or "").strip()
+        pkt = BOX.update_fields(session_id, fields)
+        if pkt is None:
+            self._json(200, {"ok": True, "pending": None, "packet": None})
+            return
+        self._json(200, {"ok": True, "pending": pkt.public(), "packet": pkt.to_dict()})
+
+    # -- POST /capture, /take, /clear ---------------------------------------
+
+    def do_POST(self):  # noqa: N802
+        path, _query = self._target()
+        if path == "/capture":
+            self._capture()
+            return
+        if path not in ("/take", "/clear"):
+            self._json(404, {"ok": False, "error": "not found"})
+            return
+        if not self._auth():
+            self._json(401, {"ok": False, "error": "unauthorized"})
+            return
+        payload = self._read_json()
+        if payload is None:
+            return
+        session_id = str(payload.get("session_id") or "").strip()
+        if path == "/take":
+            pkt = BOX.take(session_id)
+            if pkt is None:
+                self._json(200, {"ok": True, "packet": None, "screenshot_b64": None})
+                return
+            shot_b64 = _read_screenshot_b64(pkt.screenshot_path)
+            lat_core.clear_pending_marker()
+            self._json(200, {
+                "ok": True,
+                "packet": pkt.to_dict(),
+                "screenshot_b64": shot_b64,
+            })
+            return
+        cleared = BOX.clear(session_id)
+        if BOX.is_empty():
+            lat_core.clear_pending_marker()
+        self._json(200, {"ok": True, "cleared": cleared})
+
+    def _capture(self) -> None:
+        if not self._auth():
+            self._json(401, {"ok": False, "error": "unauthorized"})
+            return
+        payload = self._read_json()
+        if payload is None:
             return
 
         hint = str(payload.get("hint") or "").strip()
-        fields = payload.get("fields")
-        fields = [str(f) for f in fields if str(f) in lat_core.ALL_FIELDS] if isinstance(fields, list) else []
+        raw_fields = payload.get("fields")
+        fields = ([str(f) for f in raw_fields if str(f) in lat_core.ALL_FIELDS]
+                  if isinstance(raw_fields, list) else [])
+        # Force the local driver: when the configured backend is "companion",
+        # calling it here would HTTP back into this same server (recursion).
+        local = dataclasses.replace(self.settings, capture_backend="local")
         try:
             with self.lock:
-                cap = lat_core.capture(self.settings, hint=hint)
+                cap = lat_core.capture(local, hint=hint)
             shot_b64 = None
             if cap.screenshot_path and (not fields or "screenshot" in fields):
                 raw = Path(cap.screenshot_path).read_bytes()
@@ -167,153 +424,28 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
 
-def load_settings():
-    """Read plugins.entries.look-at-this.settings; fall back to schema defaults."""
-    data: dict = {}
-    try:
-        from hermes_cli.config import load_config_readonly
-        cfg = load_config_readonly() or {}
-        entry = (((cfg.get("plugins") or {}).get("entries") or {}).get("look-at-this") or {})
-        raw = entry.get("settings") or {}
-        if isinstance(raw, dict):
-            data = raw
-    except Exception:
-        pass
-    return lat_core.Settings.from_getter(lambda key, default=None: data.get(key, default)), data
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Global hotkey (Windows): capture the app you are in, then open Quick Entry
 # ─────────────────────────────────────────────────────────────────────────────
 
-_MOD_BITS = {"ctrl": 0x0002, "control": 0x0002, "alt": 0x0001, "shift": 0x0004,
-             "win": 0x0008, "meta": 0x0008}
-_MOD_VKS = ((0x0002, 0x11), (0x0004, 0x10), (0x0001, 0x12), (0x0008, 0x5B))
-_VK_NAMES = {"space": 0x20, "enter": 0x0D, "tab": 0x09, "esc": 0x1B, "escape": 0x1B}
 
+def capture_for_hotkey() -> None:
+    """The hotkey callback: capture locally, hold the packet, write metadata only.
 
-def parse_chord(chord: str) -> tuple[int, int]:
-    parts = [p.strip().lower() for p in str(chord).split("+") if p.strip()]
-    if not parts:
-        raise ValueError("empty hotkey")
-    key = parts[-1]
-    mods = 0
-    for part in parts[:-1]:
-        if part not in _MOD_BITS:
-            raise ValueError(f"unknown modifier {part!r}")
-        mods |= _MOD_BITS[part]
-    if key in _VK_NAMES:
-        vk = _VK_NAMES[key]
-    elif len(key) == 1 and key.isalnum():
-        vk = ord(key.upper())
-    elif key.startswith("f") and key[1:].isdigit() and 1 <= int(key[1:]) <= 24:
-        vk = 0x70 + int(key[1:]) - 1
-    else:
-        raise ValueError(f"unsupported key {key!r}")
-    return mods, vk
-
-
-def send_chord(chord: str) -> None:
-    """Synthesize a chord OS-wide (used to open Hermes Quick Entry)."""
-    mods, vk = parse_chord(chord)
-    user32 = ctypes.windll.user32
-    held = [vk_mod for bit, vk_mod in _MOD_VKS if mods & bit]
-    for vk_mod in held:
-        user32.keybd_event(vk_mod, 0, 0, 0)
-    time.sleep(0.02)
-    user32.keybd_event(vk, 0, 0, 0)
-    user32.keybd_event(vk, 0, 2, 0)
-    time.sleep(0.02)
-    for vk_mod in reversed(held):
-        user32.keybd_event(vk_mod, 0, 2, 0)
-
-
-def run_hotkey(settings: lat_core.Settings, hotkey: str, entry_chord: str) -> int:
-    if sys.platform != "win32":
-        print("Global hotkey mode is Windows-only today.")
-        return 2
+    ``run_hotkey`` opens Quick Entry after this returns; every failure is shown
+    in a MessageBox and swallowed so the hotkey loop keeps living.
+    """
+    settings = lat_core.load_settings()[0]
     try:
-        mods, vk = parse_chord(hotkey)
-        parse_chord(entry_chord)
-    except ValueError as exc:
-        print(f"Bad hotkey: {exc}")
-        return 2
-
-    user32 = ctypes.windll.user32
-    hotkey_id = 1
-    if not user32.RegisterHotKey(None, hotkey_id, mods | 0x4000, vk):  # MOD_NOREPEAT
-        user32.MessageBoxW(None, f"{hotkey} is already taken by another application.",
-                           "Look At This", 0x10)
-        return 1
-
-    print(f"Look At This: press {hotkey} in any app to ask about that window.")
-    print(f"Quick Entry chord: {entry_chord} (must match Hermes' setting)")
-
-    msg = ctypes.wintypes.MSG()
-    try:
-        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
-            if msg.message != 0x0312:  # WM_HOTKEY
-                continue
-            try:
-                cap = lat_core.capture(settings)
-                pkt = lat_core.make_packet(cap, settings, "")
-                lat_core.spool_packet(pkt)
-            except lat_core.LookAtError as exc:
-                user32.MessageBoxW(None, f"{exc}", "Look At This", 0x10)
-                continue
-            except Exception as exc:  # never kill the hotkey loop
-                user32.MessageBoxW(None, f"{type(exc).__name__}: {exc}", "Look At This", 0x10)
-                continue
-            send_chord(entry_chord)
-    finally:
-        user32.UnregisterHotKey(None, hotkey_id)
-    return 0
-
-
-def _startup_lnk() -> Path:
-    return (Path(os.environ.get("APPDATA", str(Path.home())))
-            / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
-            / "Look At This Companion.lnk")
-
-
-def install_autostart() -> int:
-    if sys.platform != "win32":
-        print("Autostart is Windows-only today.")
-        return 2
-    script = Path(__file__).resolve()
-    pythonw = Path(sys.executable).with_name("pythonw.exe")
-    exe = pythonw if pythonw.exists() else Path(sys.executable)
-    lnk = _startup_lnk()
-    lnk.parent.mkdir(parents=True, exist_ok=True)
-    ps1 = Path(tempfile.gettempdir()) / "lat_autostart.ps1"
-    ps1.write_text(
-        "$ws = New-Object -ComObject WScript.Shell\n"
-        f"$s = $ws.CreateShortcut('{lnk}')\n"
-        f"$s.TargetPath = '{exe}'\n"
-        f"$s.Arguments = '\"{script}\" --hotkey'\n"
-        f"$s.WorkingDirectory = '{script.parent}'\n"
-        "$s.Save()\n",
-        encoding="utf-8",
-    )
-    proc = subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                           "-File", str(ps1)], capture_output=True, text=True)
-    ps1.unlink(missing_ok=True)
-    if proc.returncode != 0:
-        print(proc.stderr.strip() or "Could not create the startup shortcut.")
-        return 1
-    print(f"Installed: {lnk}")
-    print("It starts at your next login. Run it once now to use it immediately.")
-    return 0
-
-
-def remove_autostart() -> int:
-    lnk = _startup_lnk()
-    if lnk.exists():
-        lnk.unlink()
-        print(f"Removed: {lnk}")
-    else:
-        print("No startup shortcut found.")
-    return 0
+        local = dataclasses.replace(settings, capture_backend="local")
+        cap = lat_core.capture(local)
+        pkt = lat_core.make_packet(cap, settings, lat_core.read_active_session())
+        BOX.put(pkt)
+        lat_core.write_pending_marker(pkt)
+    except lat_core.LookAtError as exc:
+        win_hotkey.message_box(str(exc))
+    except Exception as exc:  # never kill the hotkey loop
+        win_hotkey.message_box(f"{type(exc).__name__}: {exc}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -330,35 +462,38 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--entry-chord", default="",
                         help="Chord that opens Hermes Quick Entry (default: quick_entry_hotkey setting)")
     parser.add_argument("--no-serve", action="store_true", help="Hotkey only; do not open the HTTP port")
+    parser.add_argument("--no-open", action="store_true",
+                        help="Queue the packet without synthesizing the Quick Entry chord")
     parser.add_argument("--install-autostart", action="store_true")
     parser.add_argument("--remove-autostart", action="store_true")
     args = parser.parse_args(argv)
 
     if args.remove_autostart:
-        return remove_autostart()
+        return win_hotkey.remove_autostart()
     if args.install_autostart:
-        return install_autostart()
+        return win_hotkey.install_autostart(Path(__file__).resolve())
 
-    settings, raw = load_settings()
+    settings, _raw = lat_core.load_settings()
     token = load_or_create_token(args.token, args.token_file)
     if args.print_token:
         print(token)
         return 0
 
+    Handler.settings = settings
+    Handler.token = token
+
     if args.hotkey:
-        hotkey = args.hotkey_chord or str(raw.get("global_hotkey") or "ctrl+alt+l")
-        entry = args.entry_chord or str(raw.get("quick_entry_hotkey") or "ctrl+shift+space")
+        hotkey = args.hotkey_chord or settings.global_hotkey
+        entry = "" if args.no_open else (args.entry_chord or settings.quick_entry_hotkey)
         if not args.no_serve:
-            Handler.token = token
             server = ThreadingHTTPServer((args.host, args.port), Handler)
             threading.Thread(target=server.serve_forever, daemon=True).start()
             print(f"HTTP capture on http://{args.host}:{args.port}")
         try:
-            return run_hotkey(settings, hotkey, entry)
+            return win_hotkey.run_hotkey(hotkey, entry, capture_for_hotkey)
         except KeyboardInterrupt:
             return 0
 
-    Handler.token = token
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f"Look At This companion on http://{args.host}:{args.port}")
     print(f"token file: {token_path()}")
