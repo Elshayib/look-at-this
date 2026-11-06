@@ -578,6 +578,23 @@ class TokenTests(unittest.TestCase):
                 path.write_bytes(before)
 
 
+class SecretRouteTests(unittest.TestCase):
+    """companion_token comes through the secret scope, never from config.yaml."""
+
+    def test_secret_route_supplies_the_token_and_config_does_not(self):
+        fake = mock.Mock()
+        fake.get_secret.side_effect = (
+            lambda name, default=None: "from-env" if name == lat_core.COMPANION_TOKEN_ENV else default
+        )
+        modules = {"agent": mock.Mock(secret_scope=fake), "agent.secret_scope": fake}
+        with mock.patch.dict(sys.modules, modules):
+            settings = lat_core.Settings.from_getter(
+                lambda key, default=None: "from-config" if key == "companion_token" else default
+            )
+            self.assertEqual(settings.companion_token, "from-env")
+            self.assertEqual(lat_core._companion_token(settings), "from-env")
+
+
 class CompanionChordTests(unittest.TestCase):
     def test_ctrl_alt_letter(self):
         mods, vk = win_hotkey.parse_chord("ctrl+alt+l")

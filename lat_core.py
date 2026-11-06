@@ -95,6 +95,27 @@ def shots_dir() -> Path:
 # Settings (the plugin passes ctx.get_config values in; the API half uses these)
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ``companion_token`` is declared ``type: secret`` in plugin.yaml, so Hermes keeps
+# it in the profile's .env as ``<PLUGIN_ID>_<KEY>`` and never in config.yaml.
+COMPANION_TOKEN_ENV = "LOOK_AT_THIS_COMPANION_TOKEN"
+
+
+def companion_secret() -> str:
+    """The companion bearer token, read through Hermes's secret route.
+
+    ``agent.secret_scope.get_secret`` honours the active profile (a bare
+    ``os.environ`` read can pick up another profile's key under multiplexing).
+    Outside an agent process — the standalone companion, a probe — the import
+    or the scoped lookup fails and this returns ""; callers fall back to the
+    plugin's own ``companion.token`` file.
+    """
+    try:
+        from agent.secret_scope import get_secret
+        return str(get_secret(COMPANION_TOKEN_ENV) or "").strip()
+    except Exception:
+        return ""
+
+
 @dataclass
 class Settings:
     ttl_seconds: int = DEFAULT_TTL
@@ -140,7 +161,7 @@ class Settings:
             max_depth=max(2, min(60, int(_get("max_depth", 12)))),
             capture_backend=backend,
             companion_url=str(_get("companion_url", "http://127.0.0.1:7391")).strip().rstrip("/"),
-            companion_token=str(_get("companion_token", "") or "").strip(),
+            companion_token=companion_secret(),
             global_hotkey=str(_get("global_hotkey", "ctrl+alt+l") or "ctrl+alt+l").strip(),
             quick_entry_hotkey=str(_get("quick_entry_hotkey", "ctrl+shift+space") or "ctrl+shift+space").strip(),
         )
@@ -944,9 +965,10 @@ def capture_via_companion(settings: Settings, *, hint: str = "", include_screens
 
     if not settings.companion_url:
         raise CaptureFailed("capture_backend is 'companion' but companion_url is empty.")
-    if not settings.companion_token:
+    token = _companion_token(settings)
+    if not token:
         raise CaptureFailed(
-            "capture_backend is 'companion' but companion_token is not set. "
+            "capture_backend is 'companion' but no companion token is available. "
             "Run the companion with --print-token and save that value as a secret setting."
         )
     if not _plain_http_allowed(settings.companion_url):
@@ -961,7 +983,7 @@ def capture_via_companion(settings: Settings, *, hint: str = "", include_screens
         method="POST",
         headers={
             "Content-Type": "application/json",
-            "Authorization": f"Bearer {settings.companion_token}",
+            "Authorization": f"Bearer {token}",
         },
     )
     try:
@@ -994,7 +1016,7 @@ def capture(settings: Settings, *, hint: str = "", include_screenshot: bool = Tr
     try:
         return _capture_local(settings, hint=hint, include_screenshot=include_screenshot)
     except CuaUnavailable:
-        if settings.capture_backend == "auto" and settings.companion_url and settings.companion_token:
+        if settings.capture_backend == "auto" and settings.companion_url and _companion_token(settings):
             return capture_via_companion(settings, hint=hint, include_screenshot=include_screenshot)
         raise
 

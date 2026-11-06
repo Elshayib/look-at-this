@@ -36,18 +36,17 @@ you  ▸ Ctrl+Alt+L          (or the composer's "+" menu, or /look)
 
 ## Install
 
-The plugin ships as one folder with an agent half and a desktop half.
+```bash
+hermes plugins install look-at-this          # catalog, pinned to the reviewed commit
+```
+
+Then toggle the desktop half on once: **Capabilities → Plugins → Look At This**.
+
+From a checkout (development):
 
 ```bash
-# 1. put the folder in the active profile's plugins directory
 cp -R look-at-this "$HERMES_HOME/plugins/look-at-this"
-
-# 2. enable the agent half (tools, hook, /look)
 hermes plugins enable look-at-this
-
-# 3. enable the desktop half — it is OPT-IN by design
-#    Capabilities → Plugins → Look At This → toggle on
-#    (a unified package's desktop half inventories disabled until you flip it)
 ```
 
 The desktop half is copied by the app into `$HERMES_HOME/desktop-plugins/look-at-this/`
@@ -268,7 +267,7 @@ Settings → Plugins.
 | `max_depth` | `12` | accessibility depth walked |
 | `capture_backend` | `auto` | `auto` / `local` / `companion` |
 | `companion_url` | `http://127.0.0.1:7391` | companion base URL |
-| `companion_token` | — (secret) | bearer token printed by the companion |
+| `companion_token` | — (secret) | bearer token printed by the companion; stored in the profile `.env` as `LOOK_AT_THIS_COMPANION_TOKEN`, read through `agent.secret_scope` |
 
 ### Companion
 
@@ -280,7 +279,9 @@ python companion/lat_companion.py --host 0.0.0.0 --port 7391
 # on the gateway's profile
 hermes config set plugins.entries.look-at-this.settings.capture_backend companion
 hermes config set plugins.entries.look-at-this.settings.companion_url http://192.168.1.20:7391
-# then save the token as the secret setting (Settings → Plugins → companion_token)
+# then save the token as the secret setting (Settings → Plugins → companion_token).
+# It lands in the profile .env as LOOK_AT_THIS_COMPANION_TOKEN — never config.yaml —
+# and the plugin reads it with agent.secret_scope.get_secret, so the active profile wins.
 ```
 
 The companion never dials out and stores no history. `/capture` deletes its temporary PNG
@@ -292,7 +293,7 @@ applies) on first run; a gateway with no `companion_token` setting reads that fi
 ## Development
 
 ```bash
-python -m unittest discover -s tests -v      # 60 unit tests, no driver needed
+python -m unittest discover -s tests -v      # 61 unit tests, no driver needed
 hermes plugins validate . --install-deps     # catalog gate
 hermes plugins doctor .                      # real register(ctx) probe
 ```
@@ -313,3 +314,7 @@ skills/look-at-this/     bundled workflow skill
 assets/                  catalog image (look-at-this.png)
 tests/                   unit tests
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
