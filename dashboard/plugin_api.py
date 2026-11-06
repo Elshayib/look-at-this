@@ -128,7 +128,11 @@ def clear(payload: dict = Body(...)) -> Any:
 @router.post("/active-session")
 def active_session(payload: dict = Body(...)) -> Any:
     try:
-        CORE.write_active_session(_session(payload))
+        session_id = _session(payload)
+        CORE.write_active_session(session_id)
+        # A remote gateway writes its own active-session file; relay the id to
+        # the companion on the user's machine so a hotkey capture binds there too.
+        CORE.companion_set_active_session(_settings(), session_id)
         return {"ok": True}
     except Exception as exc:
         return _bad(exc)

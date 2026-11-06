@@ -18,6 +18,7 @@ import base64
 import ctypes
 import dataclasses
 import json
+import math
 import os
 import queue
 import re
@@ -1079,9 +1080,21 @@ class Packet:
         shot = values.get("screenshot_path")
         if shot:
             try:
-                Path(shot).resolve().relative_to(data_dir().resolve())
+                path = Path(shot).resolve()
+                path.relative_to(shots_dir().resolve())
+                if path.suffix.lower() != ".png":
+                    raise ValueError("not a png")
             except (OSError, ValueError):
-                values["screenshot_path"] = None  # never trust a path outside our own data dir
+                values["screenshot_path"] = None  # only our own shots/*.png are trusted
+        for stamp, fallback in (
+            ("created_at", time.time()),
+            ("expires_at", time.time() + DEFAULT_TTL),
+        ):
+            try:
+                value = float(values.get(stamp))
+            except (TypeError, ValueError):
+                value = fallback
+            values[stamp] = value if math.isfinite(value) and value > 0 else fallback
         if not values.get("id"):
             values["id"] = uuid.uuid4().hex[:12]
         if not values.get("app"):
@@ -1471,6 +1484,8 @@ def read_pending_marker() -> dict | None:
         if not isinstance(data, dict):
             raise ValueError("marker is not an object")
         expires = float(data.get("expires_at") or 0)
+        if not math.isfinite(expires):
+            raise ValueError("marker expiry is not finite")
     except (TypeError, ValueError):
         _unlink_quiet(path)
         return None
@@ -1480,8 +1495,21 @@ def read_pending_marker() -> dict | None:
     return data
 
 
-def clear_pending_marker() -> None:
-    _unlink_quiet(pending_marker_path())
+def clear_pending_marker(expect_id: str | None = None) -> None:
+    """Remove the marker. With *expect_id*, only if it names that packet.
+
+    The companion takes a packet, then clears its marker; a capture landing in
+    between must not have its fresh marker erased by the older take.
+    """
+    path = pending_marker_path()
+    if expect_id:
+        try:
+            data = json.loads(path.read_bytes())
+            if isinstance(data, dict) and str(data.get("id") or "") != str(expect_id):
+                return
+        except (OSError, ValueError):
+            pass
+    _unlink_quiet(path)
 
 
 def active_session_path() -> Path:
@@ -1577,21 +1605,23 @@ def companion_pending(settings: Settings, session_id: str, *, preview: bool = Fa
 
 
 def _needs_local_screenshot(pkt: Packet) -> bool:
-    """True when pkt.screenshot_path is absent, unreadable, or outside our data dir."""
+    """True when pkt.screenshot_path is absent, unreadable, or not one of our shots."""
     if not pkt.screenshot_path:
         return True
     try:
         path = Path(pkt.screenshot_path)
-        path.resolve().relative_to(data_dir().resolve())
+        path.resolve().relative_to(shots_dir().resolve())
     except (OSError, ValueError):
         return True
-    return not path.is_file()
+    return path.suffix.lower() != ".png" or not path.is_file()
 
 
-def companion_take(settings: Settings, session_id: str) -> Packet | None:
+def companion_take(settings: Settings, session_id: str, *, timeout: float = 5.0) -> Packet | None:
     """Consume the companion's pending packet for this session, writing its PNG locally."""
     try:
-        payload = companion_request(settings, "POST", "/take", {"session_id": session_id})
+        payload = companion_request(
+            settings, "POST", "/take", {"session_id": session_id}, timeout=timeout
+        )
     except LookAtError:
         return None
     raw = payload.get("packet")
@@ -1617,8 +1647,23 @@ def companion_take(settings: Settings, session_id: str) -> Packet | None:
                 pkt.screenshot_path = str(out)
             except OSError:
                 pkt.screenshot_path = None
-    clear_pending_marker()
+    clear_pending_marker(pkt.id)
     return pkt
+
+
+def companion_set_active_session(settings: Settings, session_id: str) -> bool:
+    """Relay the Desktop's focused session to the companion (for remote gateways).
+
+    For a local gateway the companion shares ``active-session`` directly; this
+    call matters when the gateway is on another machine.
+    """
+    try:
+        companion_request(
+            settings, "POST", "/active-session", {"session_id": session_id}, timeout=1.5
+        )
+        return True
+    except LookAtError:
+        return False
 
 
 def companion_update_fields(settings: Settings, session_id: str, fields: list[str]) -> Packet | None:

@@ -23,7 +23,7 @@ def pre_llm_call(session_id: str = "", **kwargs):
             # marker, so the configured backend alone is enough to ask for it.
             settings = lat_core.load_settings()[0]
             if settings.capture_backend == "companion" or lat_core.read_pending_marker() is not None:
-                pkt = lat_core.companion_take(settings, session_id)
+                pkt = lat_core.companion_take(settings, session_id, timeout=1.5)
     except Exception:
         logger.exception("look-at-this: packet store failed")
         return None

@@ -73,8 +73,9 @@ def token_path() -> Path:
 
 
 def load_or_create_token(explicit: str = "", explicit_file: str = "") -> str:
-    if explicit:
-        return explicit.strip()
+    value = str(explicit or "").strip()
+    if value:
+        return value
     path = Path(explicit_file).expanduser() if explicit_file else token_path()
     if path.exists():
         value = path.read_text(encoding="utf-8").strip()
@@ -142,7 +143,7 @@ class PendingBox:
             if not self._expired(pkt):
                 return pkt
             self._packet = None
-        lat_core.clear_pending_marker()
+        lat_core.clear_pending_marker(pkt.id)
         _unlink_png(pkt.screenshot_path)
         return None
 
@@ -162,7 +163,7 @@ class PendingBox:
             else:
                 result = pkt
         if expired:
-            lat_core.clear_pending_marker()
+            lat_core.clear_pending_marker(pkt.id)
         _unlink_png(stale_path)
         return result
 
@@ -185,14 +186,16 @@ class PendingBox:
                     pkt.screenshot_path = None
                 result = pkt
         if expired:
-            lat_core.clear_pending_marker()
+            lat_core.clear_pending_marker(pkt.id)
         _unlink_png(stale_path)
         return result
 
-    def clear(self, session_id: str) -> bool:
+    def clear(self, session_id: str, expect_id: str | None = None) -> bool:
         with self._lock:
             pkt = self._packet
             if pkt is None or not self._matches(pkt, session_id):
+                return False
+            if expect_id and pkt.id != expect_id:
                 return False
             self._packet = None
         _unlink_png(pkt.screenshot_path)
@@ -204,7 +207,7 @@ class PendingBox:
             if pkt is None or not self._expired(pkt):
                 return
             self._packet = None
-        lat_core.clear_pending_marker()
+        lat_core.clear_pending_marker(pkt.id)
         _unlink_png(pkt.screenshot_path)
 
     def is_empty(self) -> bool:
@@ -247,6 +250,8 @@ class Handler(BaseHTTPRequestHandler):
         return (parts.path.rstrip("/") or "/"), parse_qs(parts.query, keep_blank_values=True)
 
     def _auth(self) -> bool:
+        if not self.token:
+            return False
         header = self.headers.get("Authorization", "")
         prefix = "Bearer "
         if not header.startswith(prefix):
@@ -348,6 +353,16 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/capture":
             self._capture()
             return
+        if path == "/active-session":
+            if not self._auth():
+                self._json(401, {"ok": False, "error": "unauthorized"})
+                return
+            payload = self._read_json()
+            if payload is None:
+                return
+            lat_core.write_active_session(str(payload.get("session_id") or "").strip())
+            self._json(200, {"ok": True})
+            return
         if path not in ("/take", "/clear"):
             self._json(404, {"ok": False, "error": "not found"})
             return
@@ -364,16 +379,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(200, {"ok": True, "packet": None, "screenshot_b64": None})
                 return
             shot_b64 = _read_screenshot_b64(pkt.screenshot_path)
-            lat_core.clear_pending_marker()
+            lat_core.clear_pending_marker(pkt.id)
             self._json(200, {
                 "ok": True,
                 "packet": pkt.to_dict(),
                 "screenshot_b64": shot_b64,
             })
             return
-        cleared = BOX.clear(session_id)
-        if BOX.is_empty():
-            lat_core.clear_pending_marker()
+        pkt = BOX.get(session_id)
+        cleared = BOX.clear(session_id, expect_id=pkt.id) if pkt else False
+        if cleared:
+            lat_core.clear_pending_marker(pkt.id)
         self._json(200, {"ok": True, "cleared": cleared})
 
     def _capture(self) -> None:
@@ -429,11 +445,11 @@ class Handler(BaseHTTPRequestHandler):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def capture_for_hotkey() -> None:
+def capture_for_hotkey() -> bool:
     """The hotkey callback: capture locally, hold the packet, write metadata only.
 
-    ``run_hotkey`` opens Quick Entry after this returns; every failure is shown
-    in a MessageBox and swallowed so the hotkey loop keeps living.
+    Returns False when the capture was refused/failed, so ``run_hotkey`` does not
+    synthesize the Quick Entry chord into whatever dialog is now in front.
     """
     settings = lat_core.load_settings()[0]
     try:
@@ -442,10 +458,27 @@ def capture_for_hotkey() -> None:
         pkt = lat_core.make_packet(cap, settings, lat_core.read_active_session())
         BOX.put(pkt)
         lat_core.write_pending_marker(pkt)
+        return True
     except lat_core.LookAtError as exc:
         win_hotkey.message_box(str(exc))
+        return False
     except Exception as exc:  # never kill the hotkey loop
         win_hotkey.message_box(f"{type(exc).__name__}: {exc}")
+        return False
+
+
+def _sweeper(ttl_seconds: int) -> None:
+    """Drop expired packets/markers every 30 s and reap orphaned PNGs."""
+    while True:
+        time.sleep(30)
+        try:
+            BOX.sweep()
+        except Exception:
+            pass
+        try:
+            lat_core.STORE.sweep_files(ttl_seconds)
+        except Exception:
+            pass
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -474,6 +507,7 @@ def main(argv: list[str] | None = None) -> int:
         return win_hotkey.install_autostart(Path(__file__).resolve())
 
     settings, _raw = lat_core.load_settings()
+    threading.Thread(target=_sweeper, args=(settings.ttl_seconds,), daemon=True).start()
     token = load_or_create_token(args.token, args.token_file)
     if args.print_token:
         print(token)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import re
 import sys
 import time
@@ -15,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import lat_core  # noqa: E402
-from companion import win_hotkey  # noqa: E402
+from companion import lat_companion, win_hotkey  # noqa: E402
 from companion.lat_companion import PendingBox  # noqa: E402
 
 # A real 1x1 transparent PNG, used by the companion /take tests.
@@ -231,6 +232,47 @@ class PacketDictTests(unittest.TestCase):
         pkt = lat_core.Packet.from_dict(data)
         self.assertIsNone(pkt.screenshot_path)
 
+    def test_non_finite_timestamps_are_replaced(self):
+        data = packet(session_id="").to_dict()
+        data["expires_at"] = 1e999  # json parses this as +inf
+        data["created_at"] = float("inf")
+        pkt = lat_core.Packet.from_dict(data)
+        self.assertTrue(math.isfinite(pkt.expires_at))
+        self.assertTrue(math.isfinite(pkt.created_at))
+        self.assertGreater(pkt.expires_at, 0)
+        self.assertGreater(pkt.created_at, 0)
+        public = pkt.public()
+        self.assertGreaterEqual(public["expires_in"], 0)
+        self.assertIn("captured_at", public)
+
+        data["created_at"] = float("nan")
+        pkt_nan = lat_core.Packet.from_dict(data)
+        self.assertTrue(math.isfinite(pkt_nan.created_at))
+        self.assertGreater(pkt_nan.created_at, 0)
+        self.assertGreaterEqual(pkt_nan.public()["expires_in"], 0)
+
+    def test_screenshot_must_be_a_png_inside_shots(self):
+        data = packet(session_id="").to_dict()
+        token = lat_core.data_dir() / "companion.token"
+        data["screenshot_path"] = str(token)
+        self.assertIsNone(lat_core.Packet.from_dict(data).screenshot_path)
+
+        txt = lat_core.shots_dir() / "lat_not_a_png.txt"
+        txt.write_bytes(b"x")
+        self.addCleanup(txt.unlink, missing_ok=True)
+        data["screenshot_path"] = str(txt)
+        self.assertIsNone(lat_core.Packet.from_dict(data).screenshot_path)
+
+    def test_real_png_inside_shots_survives(self):
+        png = lat_core.shots_dir() / "lat_shots_only.png"
+        png.write_bytes(b"x")
+        self.addCleanup(png.unlink, missing_ok=True)
+        data = packet(session_id="").to_dict()
+        data["screenshot_path"] = str(png)
+        pkt = lat_core.Packet.from_dict(data)
+        self.assertIsNotNone(pkt.screenshot_path)
+        self.assertEqual(Path(pkt.screenshot_path).resolve(), png.resolve())
+
 
 class MarkerTests(unittest.TestCase):
     """The disk marker must never carry captured text — only routing metadata."""
@@ -289,6 +331,24 @@ class MarkerTests(unittest.TestCase):
         self.assertFalse(path.exists())
         self.assertIsNone(lat_core.read_pending_marker())
 
+    def test_clear_pending_marker_respects_expect_id(self):
+        lat_core.write_pending_marker(packet(id="A"))
+        lat_core.clear_pending_marker("B")
+        marker = lat_core.read_pending_marker()
+        self.assertIsNotNone(marker)
+        self.assertEqual(marker["id"], "A")
+        lat_core.clear_pending_marker("A")
+        self.assertFalse(lat_core.pending_marker_path().exists())
+        self.assertIsNone(lat_core.read_pending_marker())
+
+    def test_non_finite_marker_expiry_returns_none_and_is_deleted(self):
+        path = lat_core.pending_marker_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"id": "x", "expires_at": 1e999}', encoding="utf-8")
+        self.assertTrue(path.exists())
+        self.assertIsNone(lat_core.read_pending_marker())
+        self.assertFalse(path.exists())
+
     def test_active_session_roundtrip_and_clear(self):
         path = lat_core.active_session_path()
         lat_core.write_active_session("s1")
@@ -344,6 +404,43 @@ class CompanionApiTests(unittest.TestCase):
         finally:
             expected.unlink(missing_ok=True)
         self.assertFalse(lat_core.pending_marker_path().exists())
+
+    def test_companion_take_passes_timeout_and_clears_only_its_own_marker(self):
+        cfg = lat_core.Settings()
+        pkt = packet(id="take-timeout")
+        payload = {"ok": True, "packet": pkt.to_dict()}
+        lat_core.write_pending_marker(pkt)
+        with mock.patch.object(lat_core, "companion_request", return_value=payload) as req:
+            got = lat_core.companion_take(cfg, "s1", timeout=1.25)
+        self.assertIsNotNone(got)
+        self.assertEqual(got.id, "take-timeout")
+        self.assertEqual(req.call_count, 1)
+        self.assertEqual(req.call_args.kwargs.get("timeout"), 1.25)
+        self.assertEqual(req.call_args.args[1:3], ("POST", "/take"))
+        self.assertFalse(lat_core.pending_marker_path().exists())
+
+        # A newer capture's marker must survive an older take's clear.
+        lat_core.write_pending_marker(packet(id="newer"))
+        with mock.patch.object(lat_core, "companion_request", return_value=payload):
+            lat_core.companion_take(cfg, "s1", timeout=1.25)
+        marker = lat_core.read_pending_marker()
+        self.assertIsNotNone(marker)
+        self.assertEqual(marker["id"], "newer")
+
+    def test_set_active_session_posts_the_id_and_reports_success(self):
+        cfg = lat_core.Settings()
+        with mock.patch.object(lat_core, "companion_request", return_value={"ok": True}) as req:
+            self.assertTrue(lat_core.companion_set_active_session(cfg, "s1"))
+        req.assert_called_once_with(
+            cfg, "POST", "/active-session", {"session_id": "s1"}, timeout=1.5
+        )
+
+    def test_set_active_session_returns_false_when_the_companion_fails(self):
+        cfg = lat_core.Settings()
+        with mock.patch.object(
+            lat_core, "companion_request", side_effect=lat_core.LookAtError("down")
+        ):
+            self.assertFalse(lat_core.companion_set_active_session(cfg, "s1"))
 
     def test_update_pending_fields_falls_through_to_the_companion(self):
         updated = packet(fields=["url"])
@@ -433,6 +530,42 @@ class PendingBoxTests(unittest.TestCase):
         self.assertTrue(box.clear("s1"))
         self.assertFalse(Path(shot).exists())
         self.assertFalse(box.clear("s1"))
+
+    def test_clear_with_expect_id_keeps_a_foreign_packet(self):
+        shot = self._png("lat_box_expect.png")
+        box = PendingBox()
+        box.put(packet(id="mine", screenshot_path=shot))
+        self.assertFalse(box.clear("s1", expect_id="other"))
+        self.assertIsNotNone(box.get("s1"))
+        self.assertTrue(Path(shot).exists())
+        self.assertTrue(box.clear("s1", expect_id="mine"))
+        self.assertIsNone(box.get("s1"))
+        self.assertFalse(Path(shot).exists())
+
+
+class TokenTests(unittest.TestCase):
+    """A blank --token must never become the bearer secret."""
+
+    def test_whitespace_explicit_token_falls_back_to_the_token_file(self):
+        path = lat_companion.token_path()
+        before = path.read_bytes() if path.exists() else None
+        stored = before.decode("utf-8").strip() if before is not None else ""
+        try:
+            token = lat_companion.load_or_create_token("   ")
+            self.assertTrue(token)
+            self.assertEqual(token, token.strip())
+            self.assertTrue(path.exists())
+            on_disk = path.read_text(encoding="utf-8").strip()
+            self.assertTrue(on_disk)
+            self.assertEqual(token, on_disk)
+            if stored:
+                self.assertEqual(token, stored)  # reused, not regenerated
+                self.assertEqual(path.read_bytes(), before)  # file untouched
+        finally:
+            if before is None:
+                path.unlink(missing_ok=True)
+            elif path.read_bytes() != before:
+                path.write_bytes(before)
 
 
 class CompanionChordTests(unittest.TestCase):

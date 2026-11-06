@@ -101,7 +101,24 @@ def message_box(text: str, title: str = "Look At This", error: bool = True) -> N
         print(f"{title}: {text}", file=sys.stderr)
 
 
-def run_hotkey(hotkey: str, entry_chord: str, on_hotkey: Callable[[], None]) -> int:
+def _foreground() -> int:
+    try:
+        return int(ctypes.windll.user32.GetForegroundWindow() or 0)
+    except Exception:
+        return 0
+
+
+def _wait_for_focus_change(before: int, timeout: float = 1.0) -> bool:
+    """True if some other window took the foreground within *timeout*."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _foreground() != before:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def run_hotkey(hotkey: str, entry_chord: str, on_hotkey: Callable[[], bool | None]) -> int:
     """Register *hotkey*, call *on_hotkey* on each press, then open Quick Entry.
 
     Returns 0 on a clean exit, 1 when the chord is taken, 2 on a bad chord or a
@@ -138,13 +155,23 @@ def run_hotkey(hotkey: str, entry_chord: str, on_hotkey: Callable[[], None]) -> 
                 break
             if msg.message != WM_HOTKEY or msg.wParam != hotkey_id:
                 continue
+            before = _foreground()
             try:
-                on_hotkey()
+                ok = on_hotkey()
             except Exception as exc:  # never kill the hotkey loop
                 message_box(f"{type(exc).__name__}: {exc}")
                 continue
+            if ok is False:
+                continue
             if entry_chord:
                 send_chord(entry_chord)
+                if before and not _wait_for_focus_change(before):
+                    message_box(
+                        "Quick Entry did not take focus. Check that quick_entry_hotkey "
+                        "matches Settings → Keyboard Shortcuts → Quick Entry, or run "
+                        "the companion with --no-open.",
+                        error=False,
+                    )
     finally:
         user32.UnregisterHotKey(None, hotkey_id)
     return 0
