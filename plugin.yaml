@@ -7,7 +7,7 @@ description: >-
   attached as one structured, redactable, ephemeral packet to your next turn.
   User-initiated only: nothing is captured until you ask, the packet expires
   after 300 seconds and is consumed by one turn.
-author: Islam
+author: Elshayib
 license: MIT
 manifest_version: 2
 requires_hermes: ">=0.22.6"
