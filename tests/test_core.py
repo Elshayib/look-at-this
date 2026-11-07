@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import base64
+import contextlib
+import io
 import json
 import math
 import re
@@ -385,6 +387,28 @@ class MarkerTests(unittest.TestCase):
             lat_core.write_active_session("s1")
         self.assertFalse(tmp.exists())
         self.assertFalse(path.exists())
+
+
+class CompanionProcessTests(unittest.TestCase):
+    """One companion per machine, and a hotkey that can actually deliver."""
+
+    def test_second_instance_is_refused(self):
+        first = lat_companion._acquire_instance_lock()
+        try:
+            self.assertIsNotNone(first)
+            # A duplicate would fight over RegisterHotKey and serve a different
+            # packet store than the one the gateway asks.
+            self.assertIsNone(lat_companion._acquire_instance_lock())
+        finally:
+            first.close()
+
+    def test_hotkey_refuses_no_serve(self):
+        # A hotkey-only process captures into memory nobody can fetch: the
+        # gateway reads the packet over the companion's HTTP port.
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                lat_companion.main(["--hotkey", "--no-serve"])
+        self.assertEqual(caught.exception.code, 2)
 
 
 class CompanionApiTests(unittest.TestCase):

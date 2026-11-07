@@ -481,6 +481,36 @@ def _sweeper(ttl_seconds: int) -> None:
             pass
 
 
+def _acquire_instance_lock():
+    """Hold the one companion slot for this process's lifetime.
+
+    Two companions fight over the global hotkey (RegisterHotKey fails and the
+    loser parks a modal message box), and whichever one holds the chord serves
+    its own packet store — the gateway may then ask the other copy for a packet
+    it never had. The OS drops this lock when the process exits, so a crash
+    never wedges the next start.
+    """
+    path = lat_core.data_dir() / "companion.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, "a+b")
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"1")
+            handle.flush()
+        handle.seek(0)
+        if sys.platform == "win32":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Look At This capture companion")
     parser.add_argument("--host", default="127.0.0.1")
@@ -501,6 +531,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--remove-autostart", action="store_true")
     args = parser.parse_args(argv)
 
+    if args.hotkey and args.no_serve:
+        parser.error(
+            "--no-serve cannot be combined with --hotkey: hotkey captures are fetched "
+            "over the companion's HTTP port, so a hotkey-only process can never deliver "
+            "the packet it captured."
+        )
+
     if args.remove_autostart:
         return win_hotkey.remove_autostart()
     if args.install_autostart:
@@ -511,6 +548,11 @@ def main(argv: list[str] | None = None) -> int:
     token = load_or_create_token(args.token, args.token_file)
     if args.print_token:
         print(token)
+        return 0
+
+    instance = _acquire_instance_lock()
+    if instance is None:
+        print("Look At This companion is already running; leaving that one in charge.")
         return 0
 
     Handler.settings = settings
