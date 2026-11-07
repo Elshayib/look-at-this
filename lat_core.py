@@ -1564,14 +1564,29 @@ def read_active_session() -> str:
 
 
 def write_active_session(session_id: str) -> None:
+    """Record the chat the Desktop last had focused.
+
+    The desktop half republishes the focused session on every pending poll, so
+    the common case is the same id again. Treat that as a no-op instead of a
+    temp-file write + replace every few seconds, and never let a read-only or
+    unreachable home turn the poll into an error.
+    """
     path = active_session_path()
     value = str(session_id or "").strip()
     if not value:
         _unlink_quiet(path)
         return
+    try:
+        if path.read_text(encoding="utf-8").strip() == value:
+            return
+    except (OSError, ValueError):
+        pass
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(value, encoding="utf-8")
-    os.replace(tmp, path)
+    try:
+        tmp.write_text(value, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        _unlink_quiet(tmp)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

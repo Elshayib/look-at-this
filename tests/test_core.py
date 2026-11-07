@@ -367,6 +367,25 @@ class MarkerTests(unittest.TestCase):
         self.assertFalse(path.exists())
         self.assertEqual(lat_core.read_active_session(), "")
 
+    def test_active_session_same_value_does_not_rewrite(self):
+        path = lat_core.active_session_path()
+        lat_core.write_active_session("s1")
+        before = path.stat().st_mtime_ns
+        # The Desktop republishes the focused chat on every poll; a second write
+        # of the same id must not touch the file (no temp file, no replace).
+        with mock.patch.object(lat_core.os, "replace", side_effect=AssertionError("rewrote")):
+            lat_core.write_active_session("s1")
+        self.assertEqual(path.stat().st_mtime_ns, before)
+        self.assertEqual(lat_core.read_active_session(), "s1")
+
+    def test_active_session_write_failure_is_swallowed(self):
+        path = lat_core.active_session_path()
+        tmp = path.with_name(path.name + ".tmp")
+        with mock.patch.object(lat_core.os, "replace", side_effect=OSError("denied")):
+            lat_core.write_active_session("s1")
+        self.assertFalse(tmp.exists())
+        self.assertFalse(path.exists())
+
 
 class CompanionApiTests(unittest.TestCase):
     def setUp(self):
