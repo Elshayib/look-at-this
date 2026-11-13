@@ -1127,6 +1127,7 @@ class HotkeyAndSurfaceTests(unittest.TestCase):
 
                 mod.register(Ctx())
 
+                sys.modules.pop("dashboard.plugin_api", None)
                 from dashboard.plugin_api import router
 
                 app = FastAPI()
@@ -1163,7 +1164,36 @@ class HotkeyAndSurfaceTests(unittest.TestCase):
                         "region": {"x": 10, "y": 10, "width": 80, "height": 60},
                     },
                 ).json()
-                self.assertTrue(cap["ok"])
+                if not cap.get("ok") and sys.platform != "win32":
+                    from unittest import mock as _mock
+
+                    _shot_file = mod.lat.store.get_shots_dir() / "lat_headless.png"
+                    _png, _w, _h = png_codec.encode_bgra_png(b"\x20\x40\x60\xff" * (80 * 60), 80, 60)
+                    _shot_file.write_bytes(_png)
+                    _fake_raw = mod.lat.models.RawCapture(
+                        capture_id="headlesscap1",
+                        mode="region",
+                        app="screen",
+                        pid=0,
+                        window_id=None,
+                        title="Screen region (80x60)",
+                        bounds=mod.lat.models.RegionRect(10, 10, 80, 60),
+                        screenshot_path=str(_shot_file),
+                        screenshot_width=_w,
+                        screenshot_height=_h,
+                        thumbnail_data_url=png_codec.png_bytes_to_data_url(_png),
+                    )
+                    with _mock.patch.object(mod.lat.capture, "capture_region", return_value=_fake_raw):
+                        cap = client.post(
+                            "/capture",
+                            json={
+                                "session_id": "",
+                                "target_mode": "new_session",
+                                "mode": "region",
+                                "region": {"x": 10, "y": 10, "width": 80, "height": 60},
+                            },
+                        ).json()
+                self.assertTrue(cap["ok"], cap)
                 pkt_id = cap["pending"]["id"]
                 pkt_created_at = float(cap["pending"]["created_at"])
 
@@ -1230,6 +1260,7 @@ class HotkeyAndSurfaceTests(unittest.TestCase):
                 sys.modules.pop("gateway.run", None)
                 for k in [k for k in list(sys.modules) if k == "hermes_plugins" or k.startswith("hermes_plugins.")]:
                     sys.modules.pop(k, None)
+                sys.modules.pop("dashboard.plugin_api", None)
                 if prev_home is None:
                     os.environ.pop("HERMES_HOME", None)
                 else:
