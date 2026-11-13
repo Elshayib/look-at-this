@@ -1348,6 +1348,10 @@ class HotkeyAndSurfaceTests(unittest.TestCase):
         self.assertIn("session.new", src)
         self.assertIn("/retarget", src)
         self.assertIn("Where should this", src)
+        self.assertIn("$composerMounted", src)
+        self.assertIn("formatShortcutBadge", src)
+        self.assertIn("PacketInspectorDialog", src)
+        self.assertIn("!composerMounted", src)
 
 
 if __name__ == "__main__":

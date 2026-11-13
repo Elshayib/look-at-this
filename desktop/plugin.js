@@ -74,8 +74,36 @@ const HOTKEY_TARGET_OPTIONS = [
 const $pickerOpen = atom(false)
 const $inspectorOpen = atom(false)
 const $capturing = atom(false)
+const $composerMounted = atom(false)
 const $pushedPackets = atom({})
 const $destinationPrompt = atom(null)
+
+function formatShortcutBadge(chord, platform, fallback) {
+  const raw = chord === undefined || chord === null ? fallback : String(chord).trim()
+  if (!raw || raw.toLowerCase() === 'off') {
+    return null
+  }
+  const isMac = platform === 'darwin'
+  return raw
+    .split('+')
+    .map(part => {
+      const p = part.trim().toLowerCase()
+      if (p === 'mod' || p === 'cmd' || p === 'meta' || p === 'win') {
+        return isMac ? 'Cmd' : p === 'win' ? 'Win' : 'Ctrl'
+      }
+      if (p === 'ctrl' || p === 'control') {
+        return isMac ? 'Cmd' : 'Ctrl'
+      }
+      if (p === 'alt' || p === 'option') {
+        return 'Alt'
+      }
+      if (p === 'shift') {
+        return 'Shift'
+      }
+      return p.length === 1 ? p.toUpperCase() : p.charAt(0).toUpperCase() + p.slice(1)
+    })
+    .join('+')
+}
 
 let pluginCtx = null
 let lastHandledHotkeySeq = 0
@@ -1176,6 +1204,13 @@ function ComposerPreviewCard() {
   const statusQuery = usePendingStatus()
   const [updating, setUpdating] = useState(false)
 
+  useEffect(() => {
+    $composerMounted.set(true)
+    return () => {
+      $composerMounted.set(false)
+    }
+  }, [])
+
   const packet = statusQuery.data && statusQuery.data.pending
   const unboundElsewhere = !packet && sessionId ? statusQuery.data && statusQuery.data.unbound_pending : null
   const settings = (statusQuery.data && statusQuery.data.settings) || {}
@@ -1185,7 +1220,11 @@ function ComposerPreviewCard() {
   const modals = jsxs(Fragment, {
     children: [
       jsx(DestinationPickerDialog, { currentHotkeyTarget: settings.hotkey_target }),
-      jsx(WindowPickerDialog, {})
+      jsx(WindowPickerDialog, {}),
+      jsx(PacketInspectorDialog, {
+        packet: activePacket,
+        sessionId: (activePacket && activePacket.session_id) || sessionId
+      })
     ]
   })
 
@@ -1239,6 +1278,20 @@ function ComposerPreviewCard() {
             jsxs('div', {
               className: 'flex min-w-0 items-center gap-2',
               children: [
+                waiting.thumbnail_data_url
+                  ? jsx('button', {
+                      type: 'button',
+                      onClick: () => $inspectorOpen.set(true),
+                      title: 'Inspect queued capture',
+                      className: 'shrink-0 overflow-hidden rounded border transition-opacity hover:opacity-85',
+                      style: { borderColor: 'var(--ui-stroke-primary)' },
+                      children: jsx('img', {
+                        src: waiting.thumbnail_data_url,
+                        alt: waiting.app_display || 'Capture preview',
+                        className: 'h-8 w-12 object-cover'
+                      })
+                    })
+                  : null,
                 jsx(StatusDot, { tone: needsDestination ? 'warn' : 'good' }),
                 jsx('span', {
                   className: 'truncate',
@@ -1250,6 +1303,12 @@ function ComposerPreviewCard() {
             jsxs('div', {
               className: 'flex items-center gap-1.5',
               children: [
+                jsx(Button, {
+                  size: 'sm',
+                  variant: 'ghost',
+                  onClick: () => $inspectorOpen.set(true),
+                  children: 'Inspect'
+                }),
                 jsx(Button, {
                   size: 'sm',
                   variant: 'outline',
@@ -1530,7 +1589,6 @@ function ComposerPreviewCard() {
           })
         ]
       }),
-      jsx(PacketInspectorDialog, { packet, sessionId }),
       modals
     ]
   })
@@ -1539,142 +1597,173 @@ function ComposerPreviewCard() {
 function StatusBarChip() {
   const statusQuery = usePendingStatus()
   const capturing = useValue($capturing)
+  const composerMounted = useValue($composerMounted)
+  const sessionId = useValue(host.state.focusedStoredSessionId) || ''
   const packet = (statusQuery.data && (statusQuery.data.pending || statusQuery.data.unbound_pending)) || null
   const hotkeys = statusQuery.data && statusQuery.data.hotkeys
   const settings = (statusQuery.data && statusQuery.data.settings) || {}
+  const platform = (statusQuery.data && statusQuery.data.platform) || ''
 
-  const winChord = (hotkeys && hotkeys.window_hotkey) || 'Ctrl+Alt+L'
-  const snipChord = (hotkeys && hotkeys.snip_hotkey) || 'Ctrl+Alt+S'
+  const rawWin =
+    hotkeys && Object.prototype.hasOwnProperty.call(hotkeys, 'window_hotkey')
+      ? hotkeys.window_hotkey
+      : settings.window_hotkey
+  const rawSnip =
+    hotkeys && Object.prototype.hasOwnProperty.call(hotkeys, 'snip_hotkey')
+      ? hotkeys.snip_hotkey
+      : settings.snip_hotkey
+  const winChord = formatShortcutBadge(rawWin, platform, 'Ctrl+Alt+L')
+  const snipChord = formatShortcutBadge(rawSnip, platform, 'Ctrl+Alt+S')
 
-  return jsx(DropdownMenu, {
+  return jsxs(Fragment, {
     children: [
-      jsx(
-        DropdownMenuTrigger,
-        {
-          asChild: true,
-          children: jsxs('button', {
-            type: 'button',
-            className: 'inline-flex h-5 cursor-pointer items-center gap-1.5 rounded px-1.5 text-[0.6875rem] transition-colors hover:opacity-85',
-            style: { color: packet ? 'var(--ui-text-primary)' : 'var(--ui-text-secondary)' },
+      jsx(DropdownMenu, {
+        children: [
+          jsx(
+            DropdownMenuTrigger,
+            {
+              asChild: true,
+              children: jsxs('button', {
+                type: 'button',
+                className: 'inline-flex h-5 cursor-pointer items-center gap-1.5 rounded px-1.5 text-[0.6875rem] transition-colors hover:opacity-85',
+                style: { color: packet ? 'var(--ui-text-primary)' : 'var(--ui-text-secondary)' },
+                children: [
+                  packet
+                    ? jsx(StatusDot, { tone: 'good' })
+                    : jsx(Codicon, { name: 'device-camera', size: '0.78rem' }),
+                  jsx('span', {
+                    className: 'max-w-32 truncate',
+                    children: capturing
+                      ? 'Capturing…'
+                      : packet
+                        ? `Look: ${packet.app_display}`
+                        : 'Look'
+                  })
+                ]
+              })
+            },
+            'trigger'
+          ),
+          jsxs(
+            DropdownMenuContent,
+            {
+              align: 'end',
+              className: 'w-64',
+              children: [
+                jsxs(DropdownMenuItem, {
+                  onSelect: () => void runCapture('active'),
+                  children: [
+                    jsx(Codicon, { name: 'window', size: '0.875rem' }),
+                    jsx('span', { className: 'flex-1', children: 'Capture active window' }),
+                    winChord
+                      ? jsx('span', {
+                          className: 'font-mono text-[0.65rem]',
+                          style: { color: 'var(--ui-text-tertiary)' },
+                          children: winChord
+                        })
+                      : null
+                  ]
+                }),
+                jsxs(DropdownMenuItem, {
+                  onSelect: () => void runCapture('snip'),
+                  children: [
+                    jsx(Codicon, { name: 'inspect', size: '0.875rem' }),
+                    jsx('span', { className: 'flex-1', children: 'Snip screen region…' }),
+                    snipChord
+                      ? jsx('span', {
+                          className: 'font-mono text-[0.65rem]',
+                          style: { color: 'var(--ui-text-tertiary)' },
+                          children: snipChord
+                        })
+                      : null
+                  ]
+                }),
+                jsxs(DropdownMenuItem, {
+                  onSelect: () => $pickerOpen.set(true),
+                  children: [
+                    jsx(Codicon, { name: 'versions', size: '0.875rem' }),
+                    jsx('span', { className: 'flex-1', children: 'Pick an open window…' })
+                  ]
+                }),
+                packet
+                  ? jsxs(Fragment, {
+                      children: [
+                        jsx(DropdownMenuSeparator, {}),
+                        jsxs(DropdownMenuItem, {
+                          onSelect: () =>
+                            $destinationPrompt.set({
+                              packet,
+                              previousSessionId: getFocusedStoredSessionId()
+                            }),
+                          children: [
+                            jsx(Codicon, { name: 'arrow-swap', size: '0.875rem' }),
+                            jsx('span', { children: 'Move capture to session…' })
+                          ]
+                        }),
+                        jsxs(DropdownMenuItem, {
+                          onSelect: () => $inspectorOpen.set(true),
+                          children: [
+                            jsx(Codicon, { name: 'eye', size: '0.875rem' }),
+                            jsx('span', { children: 'Inspect queued capture…' })
+                          ]
+                        }),
+                        jsxs(DropdownMenuItem, {
+                          onSelect: () => void clearPendingPacket(packet.id),
+                          children: [
+                            jsx(Codicon, { name: 'trash', size: '0.875rem' }),
+                            jsx('span', { children: 'Discard queued capture' })
+                          ]
+                        })
+                      ]
+                    })
+                  : null,
+                jsx(DropdownMenuSeparator, {}),
+                jsxs(DropdownMenuItem, {
+                  onSelect: () =>
+                    void saveHotkeyTargetPreference(
+                      settings.hotkey_target === 'ask' ? 'new_session' : 'ask'
+                    ),
+                  children: [
+                    jsx(Codicon, {
+                      name: settings.hotkey_target === 'ask' ? 'question' : 'add',
+                      size: '0.875rem'
+                    }),
+                    jsx('span', {
+                      className: 'flex-1',
+                      children:
+                        settings.hotkey_target === 'ask'
+                          ? 'Hotkey: Ask where capture goes'
+                          : settings.hotkey_target === 'current_session'
+                            ? 'Hotkey: Use current chat'
+                            : 'Hotkey: Open new session'
+                    })
+                  ]
+                }),
+                jsxs(DropdownMenuItem, {
+                  onSelect: () => host.navigate(`/settings?tab=plugins&plugin=${PLUGIN_ID}`),
+                  children: [
+                    jsx(Codicon, { name: 'settings-gear', size: '0.875rem' }),
+                    jsx('span', { children: 'Look At This settings…' })
+                  ]
+                })
+              ]
+            },
+            'content'
+          )
+        ]
+      }),
+      !composerMounted
+        ? jsxs(Fragment, {
             children: [
-              packet
-                ? jsx(StatusDot, { tone: 'good' })
-                : jsx(Codicon, { name: 'device-camera', size: '0.78rem' }),
-              jsx('span', {
-                className: 'max-w-32 truncate',
-                children: capturing
-                  ? 'Capturing…'
-                  : packet
-                    ? `Look: ${packet.app_display}`
-                    : 'Look'
+              jsx(DestinationPickerDialog, { currentHotkeyTarget: settings.hotkey_target }),
+              jsx(WindowPickerDialog, {}),
+              jsx(PacketInspectorDialog, {
+                packet,
+                sessionId: (packet && packet.session_id) || sessionId
               })
             ]
           })
-        },
-        'trigger'
-      ),
-      jsxs(
-        DropdownMenuContent,
-        {
-          align: 'end',
-          className: 'w-64',
-          children: [
-            jsxs(DropdownMenuItem, {
-              onSelect: () => void runCapture('active'),
-              children: [
-                jsx(Codicon, { name: 'window', size: '0.875rem' }),
-                jsx('span', { className: 'flex-1', children: 'Capture active window' }),
-                jsx('span', {
-                  className: 'font-mono text-[0.65rem]',
-                  style: { color: 'var(--ui-text-tertiary)' },
-                  children: winChord
-                })
-              ]
-            }),
-            jsxs(DropdownMenuItem, {
-              onSelect: () => void runCapture('snip'),
-              children: [
-                jsx(Codicon, { name: 'inspect', size: '0.875rem' }),
-                jsx('span', { className: 'flex-1', children: 'Snip screen region…' }),
-                jsx('span', {
-                  className: 'font-mono text-[0.65rem]',
-                  style: { color: 'var(--ui-text-tertiary)' },
-                  children: snipChord
-                })
-              ]
-            }),
-            jsxs(DropdownMenuItem, {
-              onSelect: () => $pickerOpen.set(true),
-              children: [
-                jsx(Codicon, { name: 'versions', size: '0.875rem' }),
-                jsx('span', { className: 'flex-1', children: 'Pick an open window…' })
-              ]
-            }),
-            packet
-              ? jsxs(Fragment, {
-                  children: [
-                    jsx(DropdownMenuSeparator, {}),
-                    jsxs(DropdownMenuItem, {
-                      onSelect: () =>
-                        $destinationPrompt.set({
-                          packet,
-                          previousSessionId: getFocusedStoredSessionId()
-                        }),
-                      children: [
-                        jsx(Codicon, { name: 'arrow-swap', size: '0.875rem' }),
-                        jsx('span', { children: 'Move capture to session…' })
-                      ]
-                    }),
-                    jsxs(DropdownMenuItem, {
-                      onSelect: () => $inspectorOpen.set(true),
-                      children: [
-                        jsx(Codicon, { name: 'eye', size: '0.875rem' }),
-                        jsx('span', { children: 'Inspect queued capture…' })
-                      ]
-                    }),
-                    jsxs(DropdownMenuItem, {
-                      onSelect: () => void clearPendingPacket(packet.id),
-                      children: [
-                        jsx(Codicon, { name: 'trash', size: '0.875rem' }),
-                        jsx('span', { children: 'Discard queued capture' })
-                      ]
-                    })
-                  ]
-                })
-              : null,
-            jsx(DropdownMenuSeparator, {}),
-            jsxs(DropdownMenuItem, {
-              onSelect: () =>
-                void saveHotkeyTargetPreference(
-                  settings.hotkey_target === 'ask' ? 'new_session' : 'ask'
-                ),
-              children: [
-                jsx(Codicon, {
-                  name: settings.hotkey_target === 'ask' ? 'question' : 'add',
-                  size: '0.875rem'
-                }),
-                jsx('span', {
-                  className: 'flex-1',
-                  children:
-                    settings.hotkey_target === 'ask'
-                      ? 'Hotkey: Ask where capture goes'
-                      : settings.hotkey_target === 'current_session'
-                        ? 'Hotkey: Use current chat'
-                        : 'Hotkey: Open new session'
-                })
-              ]
-            }),
-            jsxs(DropdownMenuItem, {
-              onSelect: () => host.navigate(`/settings?tab=plugins&plugin=${PLUGIN_ID}`),
-              children: [
-                jsx(Codicon, { name: 'settings-gear', size: '0.875rem' }),
-                jsx('span', { children: 'Look At This settings…' })
-              ]
-            })
-          ]
-        },
-        'content'
-      )
+        : null
     ]
   })
 }
