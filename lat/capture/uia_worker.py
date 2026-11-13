@@ -8,6 +8,7 @@ trees in tens of milliseconds instead of paying a 3-second .NET cold start.
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import queue
@@ -53,7 +54,11 @@ Add-Type -AssemblyName UIAutomationTypes | Out-Null
 function Get-ElemValue($el) {
   try {
     $vp = $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
-    if ($null -ne $vp) { return [string]$vp.Current.Value }
+    if ($null -ne $vp) {
+      $v = [string]$vp.Current.Value
+      if ($v.Length -gt 600) { $v = $v.Substring(0, 600) }
+      return $v
+    }
   } catch {}
   return ""
 }
@@ -102,6 +107,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
     if ($maxEl -lt 20) { $maxEl = 120 }
 
     $focusInfo = Get-SelectedText $pidTarget
+    $selFallback = ""
     $urlCand = ""
     $highlights = New-Object System.Collections.Generic.List[string]
     $treeLines = New-Object System.Collections.Generic.List[string]
@@ -127,14 +133,40 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
           $count++
           $cType = [string]$node.Current.ControlType.ProgrammaticName -replace '^ControlType\.', ''
           $cName = ([string]$node.Current.Name).Trim()
+          $cAutoId = ([string]$node.Current.AutomationId).Trim()
+          $cClass = ([string]$node.Current.ClassName).Trim()
           $cVal = ""
           if ($cType -in @('Edit', 'ComboBox', 'Document', 'Text', 'StatusBar')) {
             $cVal = (Get-ElemValue $node).Trim()
           }
 
+          if ([string]$focusInfo.sel -eq "" -and $selFallback -eq "" -and $cType -in @('Document', 'Edit')) {
+            try {
+              $tpNode = $node.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern)
+              if ($null -ne $tpNode) {
+                $selParts = @()
+                foreach ($r in $tpNode.GetSelection()) {
+                  try {
+                    $txt = $r.GetText(4000)
+                    if ($txt) { $selParts += $txt }
+                  } catch {}
+                }
+                $joined = ($selParts -join "`n").Trim()
+                if ($joined -ne "") { $selFallback = $joined }
+              }
+            } catch {}
+          }
+
           if ($urlCand -eq "" -and $cType -in @('Edit', 'ComboBox') -and $cVal -ne "") {
             $lowName = $cName.ToLowerInvariant()
-            if ($lowName -match 'address|url|location|search or enter' -or $cVal -match '^https?://') {
+            $lowAutoId = $cAutoId.ToLowerInvariant()
+            $lowClass = $cClass.ToLowerInvariant()
+            if (
+              $lowName -match 'address|url|location|search or enter' -or
+              $lowAutoId -match 'address|urlbar|omnibox|location' -or
+              $lowClass -match 'omnibox|addressbar' -or
+              $cVal -match '^https?://'
+            ) {
               $urlCand = $cVal
             }
           }
@@ -175,10 +207,12 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
       }
     }
 
+    $finalSel = [string]$focusInfo.sel
+    if ($finalSel -eq "" -and $selFallback -ne "") { $finalSel = $selFallback }
     $resp = @{
       ok = $true
       url = $urlCand
-      selection = [string]$focusInfo.sel
+      selection = $finalSel
       focused_role = [string]$focusInfo.role
       focused_name = [string]$focusInfo.name
       focused_value = [string]$focusInfo.val
@@ -209,7 +243,7 @@ def normalize_browser_url(candidate: str | None, app_name: str) -> str | None:
     if val.startswith(("http://", "https://")):
         return val
     app_low = str(app_name or "").strip().lower()
-    if app_low in BROWSER_EXES:
+    if app_low in BROWSER_EXES or f"{app_low}.exe" in BROWSER_EXES:
         scheme = "http://" if val.startswith(("localhost", "127.0.0.1")) else "https://"
         return scheme + val
     return None
@@ -223,6 +257,8 @@ class UIAWorker:
         self._proc: subprocess.Popen[str] | None = None
         self._out_q: queue.Queue[str | None] = queue.Queue()
         self._ready = False
+        self._gen = 0
+        atexit.register(self.close)
 
     def _pump(self, proc: subprocess.Popen[str], out_q: queue.Queue[str | None]) -> None:
         assert proc.stdout is not None
@@ -233,12 +269,41 @@ class UIAWorker:
             pass
         out_q.put(None)
 
-    def _ensure_started(self, startup_timeout: float = 3.5) -> bool:
+    def _cleanup_proc(self, proc: Any) -> None:
+        for stream in (getattr(proc, "stdin", None), getattr(proc, "stdout", None)):
+            try:
+                if stream:
+                    stream.close()
+            except Exception:
+                pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=1.5)
+        except Exception:
+            try:
+                proc.kill()
+                proc.wait(timeout=1.0)
+            except Exception:
+                pass
+
+    def _ensure_started(
+        self,
+        startup_timeout: float = 3.5,
+        expected_gen: int | None = None,
+    ) -> bool:
         if sys.platform != "win32":
             return False
-        if self._proc is not None and self._proc.poll() is None and self._ready:
-            return True
-        self.close()
+        with self._lock:
+            gen = self._gen if expected_gen is None else expected_gen
+            if self._gen != gen:
+                return False
+            if self._proc is not None and self._proc.poll() is None and self._ready:
+                return True
+            if self._proc is not None:
+                stale = self._proc
+                self._proc = None
+                self._ready = False
+                self._cleanup_proc(stale)
 
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         try:
@@ -265,6 +330,11 @@ class UIAWorker:
         except OSError:
             return False
 
+        with self._lock:
+            if self._gen != gen:
+                self._cleanup_proc(proc)
+                return False
+
         out_q: queue.Queue[str | None] = queue.Queue()
         threading.Thread(target=self._pump, args=(proc, out_q), daemon=True).start()
         try:
@@ -273,66 +343,54 @@ class UIAWorker:
             proc.stdin.flush()
             deadline = time.time() + startup_timeout
             while time.time() < deadline:
-                rem = max(0.05, deadline - time.time())
-                line = out_q.get(timeout=rem)
+                with self._lock:
+                    if self._gen != gen:
+                        self._cleanup_proc(proc)
+                        return False
+                rem = min(0.15, max(0.02, deadline - time.time()))
+                try:
+                    line = out_q.get(timeout=rem)
+                except queue.Empty:
+                    continue
                 if line is None:
                     break
                 if '"ready":true' in line.replace(" ", ""):
-                    self._proc = proc
-                    self._out_q = out_q
-                    self._ready = True
-                    return True
+                    with self._lock:
+                        if self._gen != gen:
+                            self._cleanup_proc(proc)
+                            return False
+                        if self._proc is not None and self._proc.poll() is None and self._ready:
+                            self._cleanup_proc(proc)
+                            return True
+                        self._proc = proc
+                        self._out_q = out_q
+                        self._ready = True
+                        return True
         except Exception:
             pass
 
-        for stream in (proc.stdin, proc.stdout):
-            try:
-                if stream:
-                    stream.close()
-            except Exception:
-                pass
-        try:
-            proc.kill()
-            proc.wait(timeout=1.5)
-        except Exception:
-            pass
+        self._cleanup_proc(proc)
         return False
 
     def warmup_async(self) -> None:
         """Warm the UIA session in a daemon thread so the first capture is instant."""
         if sys.platform != "win32":
             return
+        with self._lock:
+            gen = self._gen
 
         def _bg() -> None:
-            with self._lock:
-                self._ensure_started(startup_timeout=5.0)
+            self._ensure_started(startup_timeout=5.0, expected_gen=gen)
 
         threading.Thread(target=_bg, daemon=True, name="lat-uia-warmup").start()
 
     def close(self) -> None:
         with self._lock:
+            self._gen += 1
             proc, self._proc = self._proc, None
             self._ready = False
             if proc is not None:
-                try:
-                    if proc.stdin:
-                        proc.stdin.close()
-                except Exception:
-                    pass
-                try:
-                    proc.terminate()
-                    proc.wait(timeout=1.5)
-                except Exception:
-                    try:
-                        proc.kill()
-                        proc.wait(timeout=1.0)
-                    except Exception:
-                        pass
-                try:
-                    if proc.stdout:
-                        proc.stdout.close()
-                except Exception:
-                    pass
+                self._cleanup_proc(proc)
 
     def inspect_window(
         self,
@@ -408,4 +466,16 @@ class UIAWorker:
             return url, selection, ctx
 
 
-UIA = UIAWorker()
+def _shared_uia_worker() -> UIAWorker:
+    key = "_look_at_this_shared_uia_worker"
+    existing = getattr(sys, key, None)
+    if isinstance(existing, UIAWorker):
+        return existing
+    if existing is not None and hasattr(existing, "inspect_window") and hasattr(existing, "close"):
+        return existing  # type: ignore[return-value]
+    inst = UIAWorker()
+    setattr(sys, key, inst)
+    return inst
+
+
+UIA = _shared_uia_worker()

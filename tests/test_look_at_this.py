@@ -1066,6 +1066,76 @@ class HotkeyAndSurfaceTests(unittest.TestCase):
             self.assertIs(ctypes.windll.gdi32.SelectObject.restype, wintypes.HGDIOBJ)
             self.assertIs(ctypes.windll.user32.RegisterHotKey.restype, wintypes.BOOL)
 
+    def test_uia_worker_url_singleton_and_warmup_close_race(self) -> None:
+        import io
+        import subprocess
+        import time
+        from unittest import mock
+        from lat.capture import uia_worker
+
+        self.assertEqual(
+            uia_worker.normalize_browser_url("example.com/docs", "chrome.exe"),
+            "https://example.com/docs",
+        )
+        self.assertEqual(
+            uia_worker.normalize_browser_url("example.com/docs", "chrome"),
+            "https://example.com/docs",
+        )
+        self.assertEqual(
+            uia_worker.normalize_browser_url("localhost:3000/app", "msedge"),
+            "http://localhost:3000/app",
+        )
+        self.assertIsNone(uia_worker.normalize_browser_url("example.com", "notepad.exe"))
+
+        w1 = uia_worker._shared_uia_worker()
+        w2 = uia_worker._shared_uia_worker()
+        self.assertIs(w1, w2)
+        self.assertIs(uia_worker.UIA, w1)
+
+        # Verify PS script contains 600-char ValuePattern truncation and AutomationId/ClassName + TextPattern fallback
+        self.assertIn("600", uia_worker._PS_UIA_LOOP)
+        self.assertIn("AutomationId", uia_worker._PS_UIA_LOOP)
+        self.assertIn("omnibox|addressbar", uia_worker._PS_UIA_LOOP)
+        self.assertIn("selFallback", uia_worker._PS_UIA_LOOP)
+
+        # Simulate warmup_async racing with close(): spawned process must be terminated and never attached
+        killed = []
+
+        class SlowFakeProc:
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                self.stdin = io.StringIO()
+                self.stdout = io.StringIO('{"ready":true}\n')
+                self._rc = None
+
+            def poll(self) -> int | None:
+                return self._rc
+
+            def terminate(self) -> None:
+                self._rc = -15
+                killed.append("terminate")
+
+            def kill(self) -> None:
+                self._rc = -9
+                killed.append("kill")
+
+            def wait(self, timeout: float = 1.0) -> int:
+                return 0
+
+        worker = uia_worker.UIAWorker()
+        try:
+            with (
+                mock.patch.object(sys, "platform", "win32"),
+                mock.patch.object(subprocess, "Popen", side_effect=lambda *a, **kw: (time.sleep(0.05), SlowFakeProc())[1]),
+            ):
+                worker.warmup_async()
+                worker.close()
+                time.sleep(0.15)
+            self.assertIsNone(worker._proc)
+            self.assertFalse(worker._ready)
+            self.assertTrue(len(killed) >= 1)
+        finally:
+            worker.close()
+
     def test_desktop_plugin_contract(self) -> None:
         src = (ROOT / "desktop" / "plugin.js").read_text(encoding="utf-8")
         self.assertIn("focusedStoredSessionId", src)

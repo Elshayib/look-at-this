@@ -24,8 +24,8 @@ def _backend():
 
 
 def warmup() -> None:
-    """Warm optional background helpers asynchronously (no-op off Windows)."""
-    if sys.platform == "win32":
+    """Warm optional background helpers asynchronously (no-op off Windows or under unittest)."""
+    if sys.platform == "win32" and "unittest" not in sys.modules:
         from .uia_worker import UIA
 
         UIA.warmup_async()
