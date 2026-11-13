@@ -1,0 +1,246 @@
+"""macOS capture backend using native Quartz / JXA / screencapture utilities."""
+
+from __future__ import annotations
+
+import base64
+import json
+import subprocess
+import uuid
+
+from ..models import (
+    CaptureBackendError,
+    CaptureCancelledError,
+    ExcludedWindowError,
+    NoWindowFoundError,
+    RawCapture,
+    RegionRect,
+    Settings,
+    WindowInfo,
+)
+from ..png_codec import read_png_dimensions
+from ..privacy import check_window_exclusion
+from ..store import get_shots_dir
+
+_JXA_WINDOWS = r"""
+const se = Application('System Events');
+const procs = se.applicationProcesses.whose({ visible: true })();
+const out = [];
+let z = 0;
+for (const p of procs) {
+  let name = '';
+  let pid = 0;
+  try { name = p.name(); pid = p.unixId(); } catch (e) { continue; }
+  if (!name || name.toLowerCase() === 'hermes') continue;
+  let wins = [];
+  try { wins = p.windows(); } catch (e) { continue; }
+  for (const w of wins) {
+    try {
+      const title = String(w.name() || '').trim();
+      const pos = w.position();
+      const sz = w.size();
+      if (!title || sz[0] < 80 || sz[1] < 60) continue;
+      out.push({
+        window_id: `${pid}:${z}`,
+        pid: pid,
+        app: name,
+        title: title,
+        bounds: { x: pos[0], y: pos[1], width: sz[0], height: sz[1] },
+        z_order: z++
+      });
+    } catch (e) {}
+  }
+}
+JSON.stringify(out);
+"""
+
+
+def _png_thumb(path_str: str) -> tuple[int | None, int | None, str | None]:
+    from pathlib import Path
+
+    try:
+        raw = Path(path_str).read_bytes()
+    except OSError:
+        return None, None, None
+    dims = read_png_dimensions(raw)
+    w, h = dims if dims else (None, None)
+    thumb = ("data:image/png;base64," + base64.b64encode(raw).decode("ascii")) if len(raw) <= 900_000 else None
+    return w, h, thumb
+
+
+def _macos_browser_url(app_name: str) -> str | None:
+    low = app_name.lower()
+    script = ""
+    if "chrome" in low or "brave" in low or "edge" in low or "arc" in low:
+        script = f'tell application "{app_name}" to get URL of active tab of front window'
+    elif "safari" in low:
+        script = 'tell application "Safari" to get URL of current tab of front window'
+    if not script:
+        return None
+    try:
+        res = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=2)
+        val = (res.stdout or "").strip()
+        return val if val.startswith(("http://", "https://")) else None
+    except Exception:
+        return None
+
+
+def list_windows(settings: Settings, *, include_thumbnails: bool = False) -> list[WindowInfo]:
+    try:
+        proc = subprocess.run(
+            ["osascript", "-l", "JavaScript", "-e", _JXA_WINDOWS],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        rows = json.loads((proc.stdout or "[]").strip() or "[]")
+    except Exception as exc:
+        raise CaptureBackendError(
+            f"macOS window enumeration failed: {exc}",
+            detail="Grant Hermes Accessibility & Screen Recording permissions in System Settings → Privacy & Security.",
+        ) from exc
+
+    out: list[WindowInfo] = []
+    for row in rows:
+        bounds = RegionRect.from_dict(row.get("bounds"))
+        if not bounds:
+            continue
+        app = str(row.get("app") or "unknown")
+        title = str(row.get("title") or "")
+        rule = check_window_exclusion(app, title, settings)
+        out.append(
+            WindowInfo(
+                window_id=str(row.get("window_id")),
+                pid=int(row.get("pid") or 0),
+                app=app,
+                title=title,
+                bounds=bounds,
+                z_order=int(row.get("z_order") or 0),
+                is_excluded=bool(rule),
+                exclusion_reason=rule or "",
+            )
+        )
+    for w in out:
+        if not w.is_excluded:
+            w.is_active = True
+            break
+    return out
+
+
+def capture_target_window(
+    settings: Settings,
+    *,
+    window_id: int | str | None = None,
+    hint: str = "",
+    include_screenshot: bool = True,
+    include_tree: bool = False,
+) -> RawCapture:
+    windows = list_windows(settings)
+    if not windows:
+        raise NoWindowFoundError("No visible application window was found.")
+
+    target = windows[0]
+    if window_id is not None and str(window_id):
+        found = [w for w in windows if str(w.window_id) == str(window_id)]
+        if not found:
+            raise NoWindowFoundError(f"Window {window_id!r} is no longer visible.")
+        target = found[0]
+    elif hint.strip():
+        needle = hint.strip().lower()
+        found = [w for w in windows if needle in w.app.lower() or needle in w.title.lower()]
+        if not found:
+            raise NoWindowFoundError(f"No open window matches {hint!r}.")
+        target = found[0]
+
+    if target.is_excluded:
+        raise ExcludedWindowError(f"Refused to capture {target.app_display}: {target.exclusion_reason}.")
+
+    cid = uuid.uuid4().hex[:12]
+    shot_path = None
+    w_px = h_px = None
+    thumb = None
+    if include_screenshot:
+        out_file = get_shots_dir() / f"lat_{cid}.png"
+        b = target.bounds
+        subprocess.run(
+            ["screencapture", "-x", "-R", f"{b.x},{b.y},{b.width},{b.height}", str(out_file)],
+            capture_output=True,
+            timeout=10,
+        )
+        if out_file.is_file():
+            shot_path = str(out_file)
+            w_px, h_px, thumb = _png_thumb(shot_path)
+
+    return RawCapture(
+        capture_id=cid,
+        mode="window",
+        app=target.app,
+        pid=target.pid,
+        window_id=target.window_id,
+        title=target.title,
+        bounds=target.bounds,
+        url=_macos_browser_url(target.app),
+        screenshot_path=shot_path,
+        screenshot_width=w_px,
+        screenshot_height=h_px,
+        thumbnail_data_url=thumb,
+    )
+
+
+def capture_region_rect(rect: RegionRect, settings: Settings, *, include_tree: bool = False) -> RawCapture:
+    cid = uuid.uuid4().hex[:12]
+    out_file = get_shots_dir() / f"lat_{cid}.png"
+    subprocess.run(
+        ["screencapture", "-x", "-R", f"{rect.x},{rect.y},{rect.width},{rect.height}", str(out_file)],
+        capture_output=True,
+        timeout=10,
+    )
+    if not out_file.is_file():
+        raise CaptureBackendError("macOS screencapture produced no image (check Screen Recording permission).")
+    w_px, h_px, thumb = _png_thumb(str(out_file))
+    return RawCapture(
+        capture_id=cid,
+        mode="region",
+        app="screen",
+        pid=0,
+        window_id=None,
+        title=f"Screen region ({rect.width}×{rect.height})",
+        bounds=rect,
+        screenshot_path=str(out_file),
+        screenshot_width=w_px,
+        screenshot_height=h_px,
+        thumbnail_data_url=thumb,
+    )
+
+
+def interactive_snip(settings: Settings, *, include_tree: bool = False) -> RawCapture:
+    cid = uuid.uuid4().hex[:12]
+    out_file = get_shots_dir() / f"lat_{cid}.png"
+    subprocess.run(["screencapture", "-i", "-x", str(out_file)], capture_output=True, timeout=120)
+    if not out_file.is_file():
+        raise CaptureCancelledError("Capture cancelled.")
+    w_px, h_px, thumb = _png_thumb(str(out_file))
+    return RawCapture(
+        capture_id=cid,
+        mode="region",
+        app="screen",
+        pid=0,
+        window_id=None,
+        title=f"Interactive snip ({w_px or '?'}×{h_px or '?'})",
+        bounds=RegionRect(0, 0, w_px or 1, h_px or 1),
+        screenshot_path=str(out_file),
+        screenshot_width=w_px,
+        screenshot_height=h_px,
+        thumbnail_data_url=thumb,
+    )
+
+
+def focus_hermes_window() -> bool:
+    try:
+        subprocess.run(
+            ["osascript", "-e", 'tell application "Hermes" to activate'],
+            capture_output=True,
+            timeout=2,
+        )
+        return True
+    except Exception:
+        return False

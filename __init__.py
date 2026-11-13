@@ -1,4 +1,4 @@
-"""Look At This — user-initiated, one-shot screen context for the next turn."""
+"""Look At This v2 — seamless ephemeral screen, window, and region context."""
 
 from __future__ import annotations
 
@@ -6,108 +6,118 @@ import logging
 import sys
 from pathlib import Path
 
-from . import hooks, lat_core, schemas, tools
+from .lat import api_handlers, hotkey_daemon, surfaces
+from .lat.capture import uia_worker
 
 logger = logging.getLogger(__name__)
 
-# The gateway's web server imports dashboard/plugin_api.py by path. Register the
-# already-loaded core module so both halves share one in-memory packet store.
-sys.modules.setdefault("hermes_look_at_this_core", lat_core)
 
-_HELP = """\
-/look                 capture the current window and attach it to your next message
-/look app=chrome.exe  capture a specific app or window title instead
-/look fields=url,selection
-                      capture with only these fields (screenshot, accessibility, url, selection)
-/look status          what is pending, and for how long
-/look clear           discard the pending packet and delete its screenshot
-/look help            this text"""
-
-
-def _parse(raw: str) -> dict:
-    out: dict = {"cmd": "grab", "app": "", "fields": None}
-    for token in raw.replace(",", " ").split():
-        low = token.lower()
-        if low in ("status", "clear", "help"):
-            out["cmd"] = low
-        elif low.startswith("app=") or low.startswith("window="):
-            out["app"] = token.split("=", 1)[1]
-        elif low.startswith("fields="):
-            values = [v for v in token.split("=", 1)[1].replace(",", " ").split() if v]
-            out["fields"] = [v for v in values if v in lat_core.ALL_FIELDS] or None
-    return out
-
-
-def _look(raw_args: str, session_id: str = "", platform: str = "", **kwargs) -> str:
-    parsed = _parse(raw_args or "")
-    cfg = tools.settings()
-
-    if parsed["cmd"] == "help":
-        return _HELP
-
-    if parsed["cmd"] == "status":
-        pkt = lat_core.pending_packet(session_id)
-        if pkt is None:
-            return "Look At This: nothing pending. /look captures the current window."
-        return lat_core.preview_text(pkt)
-
-    if parsed["cmd"] == "clear":
-        cleared = lat_core.clear_pending(session_id)
-        return "Look At This: pending packet discarded." if cleared else "Look At This: nothing to discard."
-
+def _refresh_mounted_web_routes() -> None:
+    """Hot-swap ``/api/plugins/look-at-this`` routes if ``web_server`` is already live."""
+    web_mod = sys.modules.get("hermes_cli.web_server")
+    app = getattr(web_mod, "app", None)
+    if app is None or not hasattr(app, "router"):
+        return
     try:
-        _pkt, preview = lat_core.grab_for_turn(
-            cfg, session_id, hint=parsed["app"], fields=parsed["fields"]
-        )
-        where = f" from {platform}" if platform else ""
-        return f"Look At This{where}:\n{preview}"
-    except lat_core.LookAtError as exc:
-        logger.info("look-at-this command refused: %s", exc)
-        detail = f"\n{exc.detail}" if exc.detail else ""
-        return f"Look At This: {exc}{detail}"
+        prefix = "/api/plugins/look-at-this"
+        routes = app.router.routes
+        deps = None
+        first_idx: int | None = None
+        kept = []
+        for idx, route in enumerate(routes):
+            rpath = str(getattr(route, "path", "") or "")
+            if rpath == prefix or rpath.startswith(prefix + "/"):
+                if first_idx is None:
+                    first_idx = idx
+                    deps = list(getattr(route, "dependencies", None) or [])
+                continue
+            kept.append(route)
+        if first_idx is None:
+            # Not mounted yet — web_server_dashboard hot-mount will pick up plugin_api.py on first request
+            return
+        before_len = len(routes)
+        app.include_router(api_handlers.build_router(), prefix=prefix, dependencies=deps or [])
+        fresh = list(routes[before_len:])
+        routes[:] = kept[:first_idx] + fresh + kept[first_idx:]
+        logger.info("look-at-this: refreshed %d live API routes on web_server", len(fresh))
+    except Exception:
+        logger.debug("look-at-this: live API route refresh skipped", exc_info=True)
 
 
 def register(ctx) -> None:
-    tools.configure(ctx.get_config)
+    surfaces.bind_context(
+        getattr(ctx, "get_config", None),
+        getattr(ctx, "ask_choice", None),
+        getattr(ctx, "set_config", None),
+    )
 
     ctx.register_tool(
         name="lat_grab",
         toolset="look_at_this",
-        schema=schemas.GRAB,
-        handler=tools.lat_grab,
-        description="Capture the user's current window (screenshot + accessibility tree + URL + selection) right now.",
+        schema=surfaces.SCHEMA_GRAB,
+        handler=surfaces.tool_lat_grab,
+        description=(
+            "Capture the user's active window, a specific open window, or a screen region "
+            "right now (screenshot + smart UI context + URL + selection)."
+        ),
+    )
+    ctx.register_tool(
+        name="lat_windows",
+        toolset="look_at_this",
+        schema=surfaces.SCHEMA_WINDOWS,
+        handler=surfaces.tool_lat_windows,
+        description="List currently visible application windows available for Look At This capture.",
     )
     ctx.register_tool(
         name="lat_status",
         toolset="look_at_this",
-        schema=schemas.STATUS,
-        handler=tools.lat_status,
-        description="Report the Look At This packet pending for this session, if any.",
+        schema=surfaces.SCHEMA_STATUS,
+        handler=surfaces.tool_lat_status,
+        description="Check if a Look At This capture packet is currently queued for this session.",
     )
     ctx.register_tool(
         name="lat_clear",
         toolset="look_at_this",
-        schema=schemas.CLEAR,
-        handler=tools.lat_clear,
-        description="Discard the pending Look At This packet and delete its screenshot.",
+        schema=surfaces.SCHEMA_CLEAR,
+        handler=surfaces.tool_lat_clear,
+        description="Discard any pending Look At This packet for this session and delete its screenshot.",
     )
 
-    ctx.register_hook("pre_llm_call", hooks.pre_llm_call)
+    ctx.register_hook("pre_llm_call", surfaces.hook_pre_llm_call)
+    ctx.register_hook("post_llm_call", surfaces.hook_post_llm_call)
+    ctx.register_hook("on_session_end", surfaces.hook_on_session_end)
+    ctx.register_middleware("llm_request", surfaces.middleware_llm_request)
+
     ctx.register_command(
         "look",
-        _look,
-        description="Capture the current window as one ephemeral context packet for your next message",
-        args_hint="[app=<name>] [fields=a,b] | status | clear | help",
+        surfaces.handle_look_command,
+        description="Capture a window or screen region as an ephemeral context packet for your next message",
+        args_hint="[pick | snip | app=<name> | redact | tree | status | clear | help]",
     )
 
     skills_dir = Path(__file__).parent / "skills"
-    if skills_dir.is_dir():
+    if skills_dir.is_dir() and hasattr(ctx, "register_skill"):
         for child in sorted(skills_dir.iterdir()):
             skill_md = child / "SKILL.md"
             if child.is_dir() and skill_md.exists():
                 try:
                     ctx.register_skill(child.name, skill_md)
                 except Exception:
-                    logger.exception("look-at-this: could not register skill %s", child.name)
+                    logger.exception("look-at-this: failed to register skill %s", child.name)
 
-    logger.info("look-at-this registered (driver=%s)", lat_core.resolve_driver() or "missing")
+    # Start OS global hotkeys automatically inside the live Hermes gateway/server,
+    # while staying completely inert during CLI validation, doctor, and one-shot commands.
+    if "gateway.run" in sys.modules or "hermes_cli.web_server" in sys.modules:
+        # Stop any legacy standalone `lat.hotkey_daemon` instance if an older import created one
+        legacy_hk_mod = sys.modules.get("lat.hotkey_daemon")
+        if legacy_hk_mod is not None and getattr(legacy_hk_mod, "HOTKEYS", None) is not hotkey_daemon.HOTKEYS:
+            try:
+                legacy_hk_mod.HOTKEYS.stop()
+            except Exception:
+                pass
+        _refresh_mounted_web_routes()
+        hk = hotkey_daemon.HOTKEYS.reload()
+        if hasattr(ctx, "on_unload"):
+            ctx.on_unload(hotkey_daemon.HOTKEYS.stop)
+            ctx.on_unload(uia_worker.UIA.close)
+        logger.info("look-at-this global hotkeys initialized: %s", hk)

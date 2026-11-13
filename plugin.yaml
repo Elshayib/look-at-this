@@ -1,12 +1,10 @@
 name: look-at-this
-version: 0.1.0
+version: 0.2.1
 description: >-
-  One-shot "explain this" context capture: press a hotkey (or /look, or the
-  composer's attach menu) and the window you were just in — screenshot,
-  accessibility tree, active URL, selected text and app/window title — is
-  attached as one structured, redactable, ephemeral packet to your next turn.
-  User-initiated only: nothing is captured until you ask, the packet expires
-  after 300 seconds and is consumed by one turn.
+  Seamless one-shot screen & window context for Hermes: press a global hotkey,
+  pick an open window, drag a screen region, or run /look — opens a fresh session
+  by default (or asks where the capture should go) and attaches the screenshot
+  ephemerally to vision models alongside smart UI context, URL, and selection.
 author: Elshayib
 license: MIT
 manifest_version: 2
@@ -17,73 +15,82 @@ platforms:
   - linux
 provides_tools:
   - lat_grab
+  - lat_windows
   - lat_status
   - lat_clear
 provides_hooks:
   - pre_llm_call
+  - post_llm_call
+  - on_session_end
+provides_middleware:
+  - llm_request
 config_schema:
+  hotkey_target:
+    type: str
+    default: new_session
+    description: >-
+      Where global hotkey captures go in Hermes Desktop: 'new_session' (default —
+      opens a new session with the capture attached), 'ask' (asks whether to open a
+      new session, use the current session, or pick an open session), or
+      'current_session' (attaches to the currently open session).
   ttl_seconds:
     type: int
     default: 300
-    description: How long a captured packet stays attachable before it expires.
+    description: Seconds a captured packet remains queued before expiring automatically.
+  window_hotkey:
+    type: str
+    default: ctrl+alt+l
+    description: System-wide shortcut to capture the foreground window immediately (set empty to disable).
+  snip_hotkey:
+    type: str
+    default: ctrl+alt+s
+    description: System-wide shortcut to open the interactive window-hover & region-snipping overlay.
+  focus_hermes_on_hotkey:
+    type: bool
+    default: true
+    description: Bring Hermes Desktop and its message composer to focus right after a global hotkey capture.
+  hotkey_hud_feedback:
+    type: bool
+    default: true
+    description: Show a brief click-through on-screen confirmation pill when a global hotkey captures a window.
+  vision_injection:
+    type: bool
+    default: true
+    description: Send the screenshot directly to vision-capable models on that turn (ephemerally, never saved in chat history).
+  default_redact:
+    type: bool
+    default: false
+    description: Enable sensitive-text redaction (emails, API keys, tokens, card numbers, auth URL params) by default on new captures.
+  include_full_tree_by_default:
+    type: bool
+    default: false
+    description: Include the full accessibility tree on every capture by default instead of compact smart context only.
+  max_tree_elements:
+    type: int
+    default: 200
+    description: Maximum accessibility elements walked when full tree extraction is enabled.
+  max_image_dim:
+    type: int
+    default: 1920
+    description: Maximum screenshot width/height in pixels (downscales ultra-high-DPI captures cleanly).
   excluded_apps:
     type: list
     default:
-      - 1password.exe
-      - 1password7.exe
-      - bitwarden.exe
-      - keepass.exe
-      - keepassxc.exe
-      - lastpass.exe
-      - dashlane.exe
-      - nordpass.exe
-      - enpass.exe
-      - keeper.exe
-    description: Process names that are never captured (case-insensitive).
+      - 1password
+      - 1password7
+      - bitwarden
+      - keepass
+      - keepassxc
+      - lastpass
+      - dashlane
+      - nordpass
+      - enpass
+      - keeper
+      - protonpass
+    description: Password managers and sensitive apps that are refused before any screenshot is taken.
   excluded_title_patterns:
     type: list
     default:
-      - "(?i)incognito"
-      - "(?i)private browsing"
-      - "(?i)inprivate"
-      - "(?i)password"
-      - "(?i)vault"
-      - "(?i)unlock"
-    description: Regular expressions matched against the window title; a match refuses the capture.
-  clipboard_fallback:
-    type: bool
-    default: false
-    description: >-
-      When the accessibility provider exposes no selection, fall back to the
-      clipboard text. Off by default because the clipboard is not a selection.
-  max_elements:
-    type: int
-    default: 300
-    description: Maximum accessibility rows kept in a packet.
-  max_depth:
-    type: int
-    default: 12
-    description: Maximum accessibility tree depth walked.
-  global_hotkey:
-    type: str
-    default: ctrl+alt+l
-    description: Chord the companion registers system-wide (Windows). Pressing it captures the app you are in and opens Quick Entry.
-  quick_entry_hotkey:
-    type: str
-    default: ctrl+shift+space
-    description: Chord that opens Hermes Quick Entry; must match the Desktop's Quick Entry shortcut.
-  capture_backend:
-    type: str
-    default: auto
-    description: >-
-      auto (local cua-driver, falling back to the companion when it is
-      configured), local (never leave this machine), or companion (capture on
-      another machine running companion/lat_companion.py).
-  companion_url:
-    type: str
-    default: "http://127.0.0.1:7391"
-    description: Base URL of the capture companion. Cleartext HTTP is only accepted for loopback and private networks.
-  companion_token:
-    type: secret
-    default: ""
-    description: Bearer token printed by the companion (--print-token). Stored in .env, never in config.yaml.
+      - "(?i)\\b(?:incognito|inprivate)\\b"
+      - "(?i)\\bprivate\\s+(?:browsing|window)\\b"
+    description: Regular expressions matched against window titles to refuse private/incognito windows.
