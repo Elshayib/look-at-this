@@ -18,7 +18,7 @@ from ..models import (
     WindowInfo,
 )
 from ..png_codec import read_png_dimensions
-from ..privacy import check_window_exclusion
+from ..privacy import check_window_exclusion, find_overlapping_excluded_window
 from ..store import get_shots_dir
 
 _JXA_WINDOWS = r"""
@@ -187,6 +187,13 @@ def capture_target_window(
 
 
 def capture_region_rect(rect: RegionRect, settings: Settings, *, include_tree: bool = False) -> RawCapture:
+    windows = list_windows(settings)
+    bad = find_overlapping_excluded_window(rect, windows)
+    if bad is not None:
+        app_lbl = bad.app_display if isinstance(bad, WindowInfo) else (bad.get("app_display") or "Protected window")
+        reason = bad.exclusion_reason if isinstance(bad, WindowInfo) else (bad.get("exclusion_reason") or "excluded window")
+        raise ExcludedWindowError(f"Refused to capture region over {app_lbl}: {reason}.")
+
     cid = uuid.uuid4().hex[:12]
     out_file = get_shots_dir() / f"lat_{cid}.png"
     subprocess.run(
@@ -213,6 +220,13 @@ def capture_region_rect(rect: RegionRect, settings: Settings, *, include_tree: b
 
 
 def interactive_snip(settings: Settings, *, include_tree: bool = False) -> RawCapture:
+    windows = list_windows(settings)
+    for w in windows:
+        if w.is_excluded and find_overlapping_excluded_window(w.bounds, windows) is not None:
+            raise ExcludedWindowError(
+                f"Refused interactive snip while protected window {w.app_display} is visible: {w.exclusion_reason}."
+            )
+
     cid = uuid.uuid4().hex[:12]
     out_file = get_shots_dir() / f"lat_{cid}.png"
     subprocess.run(["screencapture", "-i", "-x", str(out_file)], capture_output=True, timeout=120)

@@ -42,8 +42,8 @@ from ..png_codec import (
     crop_bgra,
     encode_bgra_png,
 )
-from ..privacy import check_window_exclusion
-from ..store import get_shots_dir
+from ..privacy import check_window_exclusion, find_overlapping_excluded_window
+from ..store import get_shots_dir, safe_unlink_shot
 from .uia_worker import UIA
 
 # System / shell surfaces that are never a user application window
@@ -198,7 +198,11 @@ def _ensure_unlocked_desktop() -> None:
             )
 
 
-def _capture_hwnd_bgra(hwnd: int, bounds: RegionRect) -> tuple[bytes, int, int]:
+def _capture_hwnd_bgra(
+    hwnd: int,
+    bounds: RegionRect,
+    windows: list[WindowInfo] | None = None,
+) -> tuple[bytes, int, int]:
     """Capture a window's pixels via PrintWindow(PW_RENDERFULLCONTENT) with BitBlt fallback."""
     user32 = ctypes.windll.user32
     gdi32 = ctypes.windll.gdi32
@@ -228,6 +232,14 @@ def _capture_hwnd_bgra(hwnd: int, bounds: RegionRect) -> tuple[bytes, int, int]:
         raw = buf.raw
 
         if (not ok) or buffer_is_blank(raw):
+            if windows:
+                bad = find_overlapping_excluded_window(bounds, windows, stop_at_window_id=hwnd)
+                if bad is not None:
+                    app_lbl = bad.app_display if isinstance(bad, WindowInfo) else (bad.get("app_display") or "Protected window")
+                    reason = bad.exclusion_reason if isinstance(bad, WindowInfo) else (bad.get("exclusion_reason") or "excluded window")
+                    raise ExcludedWindowError(
+                        f"Refused BitBlt fallback: excluded window {app_lbl} overlaps target ({reason})."
+                    )
             # Fallback to screen BitBlt over DWM extended bounds
             bw, bh = bounds.width, bounds.height
             if (bw, bh) != (w, h):
@@ -384,7 +396,7 @@ def list_windows(
                 if w.is_excluded:
                     continue
                 try:
-                    raw, cw, ch = _capture_hwnd_bgra(int(w.window_id), w.bounds)
+                    raw, cw, ch = _capture_hwnd_bgra(int(w.window_id), w.bounds, windows=results)
                     w.thumbnail_data_url = bgra_to_thumbnail_data_url(raw, cw, ch, max_dim=280)
                 except Exception:
                     w.thumbnail_data_url = None
@@ -398,6 +410,7 @@ def _build_window_capture(
     *,
     include_screenshot: bool = True,
     include_tree: bool = False,
+    windows: list[WindowInfo] | None = None,
 ) -> RawCapture:
     if win.is_excluded:
         raise ExcludedWindowError(
@@ -414,7 +427,7 @@ def _build_window_capture(
 
     with _per_monitor_dpi_thread():
         if include_screenshot:
-            bgra, cw, ch = _capture_hwnd_bgra(hwnd, win.bounds)
+            bgra, cw, ch = _capture_hwnd_bgra(hwnd, win.bounds, windows=windows)
             png_bytes, out_w, out_h = encode_bgra_png(bgra, cw, ch, max_dim=settings.max_image_dim)
             out_file = get_shots_dir() / f"lat_{cid}.png"
             out_file.write_bytes(png_bytes)
@@ -473,7 +486,7 @@ def capture_target_window(
         for w in windows:
             if int(w.window_id) == target_hwnd:
                 return _build_window_capture(
-                    w, settings, include_screenshot=include_screenshot, include_tree=include_tree
+                    w, settings, include_screenshot=include_screenshot, include_tree=include_tree, windows=windows
                 )
         raise NoWindowFoundError(f"Window {target_hwnd} is no longer visible.")
 
@@ -491,7 +504,7 @@ def capture_target_window(
                 detail=f"Visible windows: {available}" if available else "",
             )
         return _build_window_capture(
-            matches[0], settings, include_screenshot=include_screenshot, include_tree=include_tree
+            matches[0], settings, include_screenshot=include_screenshot, include_tree=include_tree, windows=windows
         )
 
     # Default: topmost visible non-Hermes window! If the topmost window is an
@@ -499,7 +512,7 @@ def capture_target_window(
     # silently capturing a window behind the password manager!
     top = windows[0]
     return _build_window_capture(
-        top, settings, include_screenshot=include_screenshot, include_tree=include_tree
+        top, settings, include_screenshot=include_screenshot, include_tree=include_tree, windows=windows
     )
 
 
@@ -510,6 +523,12 @@ def capture_region_rect(
     include_tree: bool = False,
 ) -> RawCapture:
     windows = list_windows(settings, include_thumbnails=False)
+    bad = find_overlapping_excluded_window(rect, windows)
+    if bad is not None:
+        app_lbl = bad.app_display if isinstance(bad, WindowInfo) else (bad.get("app_display") or "Protected window")
+        reason = bad.exclusion_reason if isinstance(bad, WindowInfo) else (bad.get("exclusion_reason") or "excluded window")
+        raise ExcludedWindowError(f"Refused to capture region over {app_lbl}: {reason}.")
+
     cx = rect.x + rect.width // 2
     cy = rect.y + rect.height // 2
     under: WindowInfo | None = None
@@ -612,6 +631,11 @@ def interactive_snip(settings: Settings, *, include_tree: bool = False) -> RawCa
     if res.get("cancelled"):
         raise CaptureCancelledError("Capture cancelled.")
 
+    if res.get("error") == "excluded_window":
+        app_lbl = res.get("app_display") or "Protected window"
+        reason = res.get("exclusion_reason") or "excluded window"
+        raise ExcludedWindowError(f"Refused to capture {app_lbl}: {reason}.")
+
     if res.get("mode") == "window" and res.get("window_id") is not None:
         return capture_target_window(
             settings,
@@ -631,6 +655,13 @@ def interactive_snip(settings: Settings, *, include_tree: bool = False) -> RawCa
     pid = 0
     win_id = None
     bounds = RegionRect.from_dict(res.get("bounds"))
+    if bounds is not None:
+        bad = find_overlapping_excluded_window(bounds, windows)
+        if bad is not None:
+            safe_unlink_shot(res.get("screenshot_path"))
+            app_lbl = bad.app_display if isinstance(bad, WindowInfo) else (bad.get("app_display") or "Protected window")
+            reason = bad.exclusion_reason if isinstance(bad, WindowInfo) else (bad.get("exclusion_reason") or "excluded window")
+            raise ExcludedWindowError(f"Refused to capture region over {app_lbl}: {reason}.")
     title = f"Screen region ({bounds.width}×{bounds.height})" if bounds else "Screen region"
 
     if isinstance(under_dict, dict) and under_dict.get("window_id"):

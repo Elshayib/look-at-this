@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import re
+from typing import Any, Iterable
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from .models import Packet, Settings
+from .models import Packet, RegionRect, Settings, WindowInfo
 
 
 def _normalize_app_token(app: str) -> str:
@@ -37,6 +38,138 @@ def check_window_exclusion(app: str, title: str, settings: Settings) -> str | No
         except re.error:
             # Fail closed on malformed user regex so a typo never leaks a blocked window
             return f"invalid exclusion pattern ({pat})"
+    return None
+
+
+def _coerce_rect_tuple(rect: RegionRect | dict[str, Any] | None) -> tuple[int, int, int, int] | None:
+    if isinstance(rect, RegionRect):
+        if rect.width <= 0 or rect.height <= 0:
+            return None
+        return (int(rect.x), int(rect.y), int(rect.x) + int(rect.width), int(rect.y) + int(rect.height))
+    if isinstance(rect, dict):
+        try:
+            x = int(rect.get("x") or 0)
+            y = int(rect.get("y") or 0)
+            w = int(rect.get("width") or 0)
+            h = int(rect.get("height") or 0)
+        except (TypeError, ValueError):
+            return None
+        if w <= 0 or h <= 0:
+            return None
+        return (x, y, x + w, y + h)
+    return None
+
+
+def _win_field(win: WindowInfo | dict[str, Any], name: str, default: Any = None) -> Any:
+    if isinstance(win, dict):
+        return win.get(name, default)
+    return getattr(win, name, default)
+
+
+def _intersect_rect(
+    a: tuple[int, int, int, int], b: tuple[int, int, int, int]
+) -> tuple[int, int, int, int] | None:
+    x0 = max(a[0], b[0])
+    y0 = max(a[1], b[1])
+    x1 = min(a[2], b[2])
+    y1 = min(a[3], b[3])
+    if x1 <= x0 or y1 <= y0:
+        return None
+    return (x0, y0, x1, y1)
+
+
+def _subtract_rect(
+    rect: tuple[int, int, int, int], cutter: tuple[int, int, int, int]
+) -> list[tuple[int, int, int, int]]:
+    inter = _intersect_rect(rect, cutter)
+    if inter is None:
+        return [rect]
+    rx0, ry0, rx1, ry1 = rect
+    ix0, iy0, ix1, iy1 = inter
+    pieces: list[tuple[int, int, int, int]] = []
+    if iy0 > ry0:
+        pieces.append((rx0, ry0, rx1, iy0))
+    if iy1 < ry1:
+        pieces.append((rx0, iy1, rx1, ry1))
+    if ix0 > rx0:
+        pieces.append((rx0, iy0, ix0, iy1))
+    if ix1 < rx1:
+        pieces.append((ix1, iy0, rx1, iy1))
+    return pieces
+
+
+def unoccluded_excluded_rects(
+    rect: RegionRect | dict[str, Any],
+    windows: Iterable[WindowInfo | dict[str, Any]],
+    *,
+    stop_at_window_id: int | str | None = None,
+) -> list[RegionRect]:
+    """Return visible, unoccluded sub-rectangles of excluded windows overlapping *rect*."""
+    target = _coerce_rect_tuple(rect)
+    if target is None:
+        return []
+    occluders: list[tuple[int, int, int, int]] = []
+    visible: list[RegionRect] = []
+    stop_str = str(stop_at_window_id) if stop_at_window_id is not None else None
+
+    for w in windows:
+        wid = _win_field(w, "window_id")
+        if stop_str is not None and wid is not None and str(wid) == stop_str:
+            break
+        wb = _coerce_rect_tuple(_win_field(w, "bounds"))
+        if wb is None:
+            continue
+        if bool(_win_field(w, "is_excluded")):
+            inter = _intersect_rect(target, wb)
+            if inter is not None:
+                rem = [inter]
+                for occ in occluders:
+                    next_rem: list[tuple[int, int, int, int]] = []
+                    for piece in rem:
+                        next_rem.extend(_subtract_rect(piece, occ))
+                    rem = next_rem
+                    if not rem:
+                        break
+                for rx0, ry0, rx1, ry1 in rem:
+                    visible.append(RegionRect(x=rx0, y=ry0, width=rx1 - rx0, height=ry1 - ry0))
+        occluders.append(wb)
+    return visible
+
+
+def find_overlapping_excluded_window(
+    rect: RegionRect | dict[str, Any],
+    windows: Iterable[WindowInfo | dict[str, Any]],
+    *,
+    stop_at_window_id: int | str | None = None,
+) -> WindowInfo | dict[str, Any] | None:
+    """Return the frontmost excluded window with visible unoccluded overlap on *rect*."""
+    target = _coerce_rect_tuple(rect)
+    if target is None:
+        return None
+    occluders: list[tuple[int, int, int, int]] = []
+    stop_str = str(stop_at_window_id) if stop_at_window_id is not None else None
+
+    for w in windows:
+        wid = _win_field(w, "window_id")
+        if stop_str is not None and wid is not None and str(wid) == stop_str:
+            break
+        wb = _coerce_rect_tuple(_win_field(w, "bounds"))
+        if wb is None:
+            continue
+        if bool(_win_field(w, "is_excluded")):
+            inter = _intersect_rect(target, wb)
+            if inter is not None:
+                rem = [inter]
+                for occ in occluders:
+                    next_rem: list[tuple[int, int, int, int]] = []
+                    for piece in rem:
+                        next_rem.extend(_subtract_rect(piece, occ))
+                    rem = next_rem
+                    if not rem:
+                        break
+                if rem:
+                    return w
+        occluders.append(wb)
     return None
 
 

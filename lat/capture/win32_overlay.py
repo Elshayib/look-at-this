@@ -24,6 +24,7 @@ if sys.platform == "win32":
     import ctypes.wintypes as wt
 
 from ..png_codec import bgra_to_thumbnail_data_url, crop_bgra, encode_bgra_png
+from ..privacy import find_overlapping_excluded_window, unoccluded_excluded_rects
 
 
 class _BITMAPINFOHEADER(ctypes.Structure):
@@ -53,6 +54,69 @@ class _BLENDFUNCTION(ctypes.Structure):
         ("SourceConstantAlpha", ctypes.c_ubyte),
         ("AlphaFormat", ctypes.c_ubyte),
     ]
+
+
+def _window_at(sx: int, sy: int, windows_meta: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Return the topmost visible window containing virtual-screen coordinates (sx, sy)."""
+    for w in windows_meta:
+        b = w.get("bounds") or {}
+        bx, by, bw, bh = int(b.get("x", 0)), int(b.get("y", 0)), int(b.get("width", 0)), int(b.get("height", 0))
+        if bx <= sx < bx + bw and by <= sy < by + bh:
+            return w
+    return None
+
+
+def _resolve_snip_release(
+    x0: int,
+    y0: int,
+    x1: int,
+    y1: int,
+    vx: int,
+    vy: int,
+    vw: int,
+    vh: int,
+    windows_meta: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Resolve click vs region-drag release in overlay coordinates, enforcing privacy exclusions."""
+    dx = abs(x1 - x0)
+    dy = abs(y1 - y0)
+    if dx < 8 and dy < 8:
+        target = _window_at(x1 + vx, y1 + vy, windows_meta)
+        if not target:
+            return {"action": "cancel"}
+        if target.get("is_excluded"):
+            return {
+                "action": "excluded",
+                "app_display": target.get("app_display") or target.get("app") or "Protected window",
+                "exclusion_reason": target.get("exclusion_reason") or "excluded window",
+            }
+        return {"action": "window", "window_id": target["window_id"]}
+
+    rx0 = max(0, min(x0, x1))
+    ry0 = max(0, min(y0, y1))
+    rw = max(12, min(vw - rx0, dx))
+    rh = max(12, min(vh - ry0, dy))
+    region_screen = {"x": rx0 + vx, "y": ry0 + vy, "width": rw, "height": rh}
+    bad = find_overlapping_excluded_window(region_screen, windows_meta)
+    if bad is not None:
+        return {
+            "action": "excluded",
+            "app_display": bad.get("app_display") or bad.get("app") or "Protected window",
+            "exclusion_reason": bad.get("exclusion_reason") or "excluded window",
+        }
+    cx = rx0 + rw // 2 + vx
+    cy = ry0 + rh // 2 + vy
+    under = _window_at(cx, cy, windows_meta)
+    if under and under.get("is_excluded"):
+        under = None
+    return {
+        "action": "region",
+        "rx0": rx0,
+        "ry0": ry0,
+        "rw": rw,
+        "rh": rh,
+        "under": under,
+    }
 
 
 def _run_win32_snip(shots_dir: Path, max_dim: int, windows_meta: list[dict[str, Any]]) -> dict[str, Any]:
@@ -88,6 +152,19 @@ def _run_win32_snip(shots_dir: Path, max_dim: int, windows_meta: list[dict[str, 
     CAPTUREBLT = 0x40000000
     gdi32.BitBlt(hdc_clean, 0, 0, vw, vh, hdc_screen, vx, vy, SRCCOPY | CAPTUREBLT)
 
+    # Mask any visible unoccluded excluded window regions before dimming or reading pixels
+    black_brush = gdi32.GetStockObject(4)  # BLACK_BRUSH
+    mask_brush = gdi32.CreateSolidBrush(0x00181512)
+    for ex_rect in unoccluded_excluded_rects({"x": vx, "y": vy, "width": vw, "height": vh}, windows_meta):
+        mx0 = max(0, ex_rect.x - vx)
+        my0 = max(0, ex_rect.y - vy)
+        mx1 = min(vw, ex_rect.x + ex_rect.width - vx)
+        my1 = min(vh, ex_rect.y + ex_rect.height - vy)
+        if mx1 > mx0 and my1 > my0:
+            mrc = wt.RECT(mx0, my0, mx1, my1)
+            user32.FillRect(hdc_clean, ctypes.byref(mrc), mask_brush)
+    gdi32.DeleteObject(mask_brush)
+
     # Also pre-build dimmed desktop DC once using hardware AlphaBlend (<1ms!)
     hdc_dim = gdi32.CreateCompatibleDC(hdc_screen)
     hbmp_dim = gdi32.CreateCompatibleBitmap(hdc_screen, vw, vh)
@@ -97,7 +174,6 @@ def _run_win32_snip(shots_dir: Path, max_dim: int, windows_meta: list[dict[str, 
     hdc_black = gdi32.CreateCompatibleDC(hdc_screen)
     hbmp_black = gdi32.CreateCompatibleBitmap(hdc_screen, 1, 1)
     old_black = gdi32.SelectObject(hdc_black, hbmp_black)
-    black_brush = gdi32.GetStockObject(4)  # BLACK_BRUSH
     rc1 = wt.RECT(0, 0, 1, 1)
     user32.FillRect(hdc_black, ctypes.byref(rc1), black_brush)
     blend = _BLENDFUNCTION(0, 0, 120, 0)  # ~47% dim veil
@@ -123,6 +199,7 @@ def _run_win32_snip(shots_dir: Path, max_dim: int, windows_meta: list[dict[str, 
 
     # Styling brushes & font
     accent_brush = gdi32.CreateSolidBrush(0x00F68B3B)  # BGR warm electric blue (#3B8BF6)
+    blocked_brush = gdi32.CreateSolidBrush(0x004444EF)  # BGR warning red
     white_brush = gdi32.CreateSolidBrush(0x00FFFFFF)
     pill_bg_brush = gdi32.CreateSolidBrush(0x001E1A17)
     hfont = gdi32.CreateFontW(
@@ -142,22 +219,11 @@ def _run_win32_snip(shots_dir: Path, max_dim: int, windows_meta: list[dict[str, 
         "result": {"cancelled": True},
     }
 
-    def _window_at(sx: int, sy: int) -> dict[str, Any] | None:
-        # sx, sy are virtual-screen coordinates
-        for w in windows_meta:
-            if w.get("is_excluded"):
-                continue
-            b = w.get("bounds") or {}
-            bx, by, bw, bh = int(b.get("x", 0)), int(b.get("y", 0)), int(b.get("width", 0)), int(b.get("height", 0))
-            if bx <= sx < bx + bw and by <= sy < by + bh:
-                return w
-        return None
-
     pt_init = wt.POINT()
     if user32.GetCursorPos(ctypes.byref(pt_init)):
         state["mx"] = pt_init.x - vx
         state["my"] = pt_init.y - vy
-        state["hovered"] = _window_at(pt_init.x, pt_init.y)
+        state["hovered"] = _window_at(pt_init.x, pt_init.y, windows_meta)
 
     def _draw_frame(hwnd_overlay: int) -> None:
         gdi32.BitBlt(hdc_back, 0, 0, vw, vh, hdc_dim, 0, 0, SRCCOPY)
@@ -165,6 +231,7 @@ def _run_win32_snip(shots_dir: Path, max_dim: int, windows_meta: list[dict[str, 
         label_text = "Click any window to capture  •  Drag to snip region  •  Esc to cancel"
         rx0 = ry0 = rx1 = ry1 = 0
         has_highlight = False
+        is_blocked = False
 
         if state["down"] and (abs(state["x1"] - state["x0"]) >= 8 or abs(state["y1"] - state["y0"]) >= 8):
             rx0 = max(0, min(state["x0"], state["x1"]))
@@ -172,7 +239,19 @@ def _run_win32_snip(shots_dir: Path, max_dim: int, windows_meta: list[dict[str, 
             rx1 = min(vw, max(state["x0"], state["x1"]))
             ry1 = min(vh, max(state["y0"], state["y1"]))
             has_highlight = (rx1 > rx0) and (ry1 > ry0)
-            label_text = f"Region {rx1 - rx0} × {ry1 - ry0} px  •  Release to capture  •  Esc to cancel"
+            bad = (
+                find_overlapping_excluded_window(
+                    {"x": rx0 + vx, "y": ry0 + vy, "width": rx1 - rx0, "height": ry1 - ry0},
+                    windows_meta,
+                )
+                if has_highlight
+                else None
+            )
+            if bad is not None:
+                is_blocked = True
+                label_text = "Protected window — capture blocked by privacy rules  •  Esc to cancel"
+            else:
+                label_text = f"Region {rx1 - rx0} × {ry1 - ry0} px  •  Release to capture  •  Esc to cancel"
         elif state["hovered"]:
             b = state["hovered"]["bounds"]
             rx0 = max(0, int(b["x"]) - vx)
@@ -180,19 +259,25 @@ def _run_win32_snip(shots_dir: Path, max_dim: int, windows_meta: list[dict[str, 
             rx1 = min(vw, int(b["x"]) + int(b["width"]) - vx)
             ry1 = min(vh, int(b["y"]) + int(b["height"]) - vy)
             has_highlight = (rx1 > rx0) and (ry1 > ry0)
-            app_lbl = state["hovered"].get("app_display") or state["hovered"].get("app") or "Window"
-            ttl = (state["hovered"].get("title") or "").strip()
-            if len(ttl) > 48:
-                ttl = ttl[:47] + "…"
-            label_text = f"{app_lbl}" + (f" — {ttl}" if ttl else "") + f" ({rx1 - rx0}×{ry1 - ry0})  •  Click to capture, or drag region"
+            if state["hovered"].get("is_excluded"):
+                is_blocked = True
+                label_text = "Protected window — capture blocked by privacy rules  •  Esc to cancel"
+            else:
+                app_lbl = state["hovered"].get("app_display") or state["hovered"].get("app") or "Window"
+                ttl = (state["hovered"].get("title") or "").strip()
+                if len(ttl) > 48:
+                    ttl = ttl[:47] + "…"
+                label_text = f"{app_lbl}" + (f" — {ttl}" if ttl else "") + f" ({rx1 - rx0}×{ry1 - ry0})  •  Click to capture, or drag region"
 
         if has_highlight:
             rw = rx1 - rx0
             rh = ry1 - ry0
-            gdi32.BitBlt(hdc_back, rx0, ry0, rw, rh, hdc_clean, rx0, ry0, SRCCOPY)
+            if not is_blocked:
+                gdi32.BitBlt(hdc_back, rx0, ry0, rw, rh, hdc_clean, rx0, ry0, SRCCOPY)
+            frame_brush = blocked_brush if is_blocked else accent_brush
             for inset in (0, 1):
                 rc = wt.RECT(rx0 - inset, ry0 - inset, rx1 + inset, ry1 + inset)
-                user32.FrameRect(hdc_back, ctypes.byref(rc), accent_brush)
+                user32.FrameRect(hdc_back, ctypes.byref(rc), frame_brush)
 
         # Draw top-center floating HUD banner pill on primary monitor area
         pill_w = min(vw - 40, max(440, len(label_text) * 8 + 44))
@@ -291,7 +376,7 @@ def _run_win32_snip(shots_dir: Path, max_dim: int, windows_meta: list[dict[str, 
                 state["x1"] = x
                 state["y1"] = y
             else:
-                state["hovered"] = _window_at(x + vx, y + vy)
+                state["hovered"] = _window_at(x + vx, y + vy, windows_meta)
             _draw_frame(hwnd)
             return 0
         if msg == 0x0202:  # WM_LBUTTONUP
@@ -301,28 +386,34 @@ def _run_win32_snip(shots_dir: Path, max_dim: int, windows_meta: list[dict[str, 
             user32.ReleaseCapture()
             x = ctypes.c_short(lparam & 0xFFFF).value
             y = ctypes.c_short((lparam >> 16) & 0xFFFF).value
-            dx = abs(x - state["x0"])
-            dy = abs(y - state["y0"])
-            if dx < 8 and dy < 8:
-                target = _window_at(x + vx, y + vy)
-                if target:
-                    state["result"] = {"cancelled": False, "mode": "window", "window_id": target["window_id"]}
-                else:
-                    state["result"] = {"cancelled": True}
-            else:
-                rx0 = max(0, min(state["x0"], x))
-                ry0 = max(0, min(state["y0"], y))
-                rw = max(12, min(vw - rx0, abs(x - state["x0"])))
-                rh = max(12, min(vh - ry0, abs(y - state["y0"])))
+            resolved = _resolve_snip_release(
+                state["x0"], state["y0"], x, y, vx, vy, vw, vh, windows_meta
+            )
+            action = resolved.get("action")
+            if action == "excluded":
+                state["result"] = {
+                    "cancelled": False,
+                    "error": "excluded_window",
+                    "app_display": resolved.get("app_display", "Protected window"),
+                    "exclusion_reason": resolved.get("exclusion_reason", "excluded window"),
+                }
+            elif action == "window":
+                state["result"] = {
+                    "cancelled": False,
+                    "mode": "window",
+                    "window_id": resolved["window_id"],
+                }
+            elif action == "region":
+                rx0 = int(resolved["rx0"])
+                ry0 = int(resolved["ry0"])
+                rw = int(resolved["rw"])
+                rh = int(resolved["rh"])
                 cropped, cw, ch = crop_bgra(clean_bgra.raw, vw, vh, rx0, ry0, rw, rh)
                 cid = uuid.uuid4().hex[:12]
                 out_path = shots_dir / f"lat_{cid}.png"
                 png_bytes, out_w, out_h = encode_bgra_png(cropped, cw, ch, max_dim=max_dim)
                 out_path.write_bytes(png_bytes)
                 thumb = bgra_to_thumbnail_data_url(cropped, cw, ch, max_dim=360)
-                cx = rx0 + cw // 2 + vx
-                cy = ry0 + ch // 2 + vy
-                under = _window_at(cx, cy)
                 state["result"] = {
                     "cancelled": False,
                     "mode": "region",
@@ -332,8 +423,10 @@ def _run_win32_snip(shots_dir: Path, max_dim: int, windows_meta: list[dict[str, 
                     "screenshot_width": out_w,
                     "screenshot_height": out_h,
                     "thumbnail_data_url": thumb,
-                    "under_window": under,
+                    "under_window": resolved.get("under"),
                 }
+            else:
+                state["result"] = {"cancelled": True}
             user32.DestroyWindow(hwnd)
             return 0
         if msg == 0x0002:  # WM_DESTROY
@@ -403,6 +496,7 @@ def _run_win32_snip(shots_dir: Path, max_dim: int, windows_meta: list[dict[str, 
     gdi32.DeleteObject(hbmp_back)
     gdi32.DeleteDC(hdc_back)
     gdi32.DeleteObject(accent_brush)
+    gdi32.DeleteObject(blocked_brush)
     gdi32.DeleteObject(white_brush)
     gdi32.DeleteObject(pill_bg_brush)
     gdi32.DeleteObject(hfont)

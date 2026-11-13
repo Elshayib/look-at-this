@@ -19,8 +19,8 @@ from ..models import (
     WindowInfo,
 )
 from ..png_codec import read_png_dimensions
-from ..privacy import check_window_exclusion
-from ..store import get_shots_dir
+from ..privacy import check_window_exclusion, find_overlapping_excluded_window
+from ..store import get_shots_dir, safe_unlink_shot
 
 
 def _png_meta(path: Path) -> tuple[int | None, int | None, str | None]:
@@ -175,7 +175,27 @@ def capture_target_window(
     )
 
 
+def _parse_slurp_geom(geom: str) -> RegionRect | None:
+    try:
+        pos_s, size_s = geom.strip().split(None, 1)
+        x_s, y_s = pos_s.split(",", 1)
+        w_s, h_s = size_s.lower().split("x", 1)
+        w, h = int(w_s), int(h_s)
+        if w <= 0 or h <= 0:
+            return None
+        return RegionRect(x=int(x_s), y=int(y_s), width=w, height=h)
+    except Exception:
+        return None
+
+
 def capture_region_rect(rect: RegionRect, settings: Settings, *, include_tree: bool = False) -> RawCapture:
+    windows = list_windows(settings)
+    bad = find_overlapping_excluded_window(rect, windows)
+    if bad is not None:
+        app_lbl = bad.app_display if isinstance(bad, WindowInfo) else (bad.get("app_display") or "Protected window")
+        reason = bad.exclusion_reason if isinstance(bad, WindowInfo) else (bad.get("exclusion_reason") or "excluded window")
+        raise ExcludedWindowError(f"Refused to capture region over {app_lbl}: {reason}.")
+
     cid = uuid.uuid4().hex[:12]
     out_file = get_shots_dir() / f"lat_{cid}.png"
     _shoot_rect(rect, out_file)
@@ -199,6 +219,13 @@ def capture_region_rect(rect: RegionRect, settings: Settings, *, include_tree: b
 
 
 def interactive_snip(settings: Settings, *, include_tree: bool = False) -> RawCapture:
+    windows = list_windows(settings)
+    for w in windows:
+        if w.is_excluded and find_overlapping_excluded_window(w.bounds, windows) is not None:
+            raise ExcludedWindowError(
+                f"Refused interactive snip while protected window {w.app_display} is visible: {w.exclusion_reason}."
+            )
+
     cid = uuid.uuid4().hex[:12]
     out_file = get_shots_dir() / f"lat_{cid}.png"
     if shutil.which("grim") and shutil.which("slurp"):
@@ -206,6 +233,13 @@ def interactive_snip(settings: Settings, *, include_tree: bool = False) -> RawCa
         geom = (slurp.stdout or "").strip()
         if slurp.returncode != 0 or not geom:
             raise CaptureCancelledError("Capture cancelled.")
+        parsed = _parse_slurp_geom(geom)
+        if parsed is not None:
+            bad = find_overlapping_excluded_window(parsed, windows)
+            if bad is not None:
+                app_lbl = bad.app_display if isinstance(bad, WindowInfo) else (bad.get("app_display") or "Protected window")
+                reason = bad.exclusion_reason if isinstance(bad, WindowInfo) else (bad.get("exclusion_reason") or "excluded window")
+                raise ExcludedWindowError(f"Refused to capture region over {app_lbl}: {reason}.")
         subprocess.run(["grim", "-g", geom, str(out_file)], capture_output=True, timeout=10)
     elif shutil.which("import"):
         subprocess.run(["import", str(out_file)], capture_output=True, timeout=120)

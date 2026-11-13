@@ -126,6 +126,83 @@ class PrivacyAndRedactionTests(unittest.TestCase):
         self.assertIn("tab=home", texts_on["url"] or "")
         self.assertEqual(applied_on, detected_off)
 
+    def test_region_overlap_and_overlay_exclusion_rules(self) -> None:
+        from unittest.mock import patch as mock_patch
+        from lat.capture import linux_backend, macos_backend, win32_overlay
+
+        excluded = models.WindowInfo(
+            window_id=10,
+            pid=100,
+            app="1Password.exe",
+            title="Vault",
+            bounds=models.RegionRect(100, 100, 300, 200),
+            z_order=0,
+            is_excluded=True,
+            exclusion_reason="excluded app (1Password.exe)",
+        )
+        normal = models.WindowInfo(
+            window_id=20,
+            pid=200,
+            app="Code.exe",
+            title="editor.py",
+            bounds=models.RegionRect(0, 0, 800, 600),
+            z_order=1,
+            is_excluded=False,
+        )
+        windows = [excluded, normal]
+
+        # Region whose center (20, 20) is outside 1Password, but corner overlaps 1Password -> MUST refuse!
+        partial = models.RegionRect(0, 0, 150, 150)
+        self.assertIs(privacy.find_overlapping_excluded_window(partial, windows), excluded)
+
+        # BitBlt fallback for `normal` behind `excluded` must refuse when excluded overlaps normal
+        self.assertIs(
+            privacy.find_overlapping_excluded_window(normal.bounds, windows, stop_at_window_id=normal.window_id),
+            excluded,
+        )
+        # No excluded window in front of `excluded` itself
+        self.assertIsNone(
+            privacy.find_overlapping_excluded_window(excluded.bounds, windows, stop_at_window_id=excluded.window_id)
+        )
+
+        # Excluded window completely occluded by a larger higher-Z normal window -> allowed!
+        occluding_front = models.WindowInfo(
+            window_id=30,
+            pid=300,
+            app="chrome.exe",
+            title="Docs",
+            bounds=models.RegionRect(50, 50, 450, 350),
+            z_order=0,
+            is_excluded=False,
+        )
+        occluded_windows = [occluding_front, excluded]
+        self.assertIsNone(privacy.find_overlapping_excluded_window(models.RegionRect(0, 0, 500, 500), occluded_windows))
+
+        # Overlay _window_at must NOT skip excluded windows in front of normal windows
+        meta = [excluded.to_dict(), normal.to_dict()]
+        hit = win32_overlay._window_at(150, 150, meta)
+        self.assertIsNotNone(hit)
+        assert hit is not None
+        self.assertEqual(hit["window_id"], 10)
+        self.assertTrue(hit["is_excluded"])
+
+        # Click on excluded window returns excluded action; drag partially overlapping excluded returns excluded
+        click_res = win32_overlay._resolve_snip_release(150, 150, 151, 151, 0, 0, 1920, 1080, meta)
+        self.assertEqual(click_res["action"], "excluded")
+        drag_res = win32_overlay._resolve_snip_release(0, 0, 150, 150, 0, 0, 1920, 1080, meta)
+        self.assertEqual(drag_res["action"], "excluded")
+        safe_drag = win32_overlay._resolve_snip_release(0, 0, 80, 80, 0, 0, 1920, 1080, meta)
+        self.assertEqual(safe_drag["action"], "region")
+
+        # macOS and Linux region capture enforce exclusions
+        cfg = models.Settings()
+        with mock_patch.object(macos_backend, "list_windows", return_value=windows):
+            with self.assertRaises(models.ExcludedWindowError):
+                macos_backend.capture_region_rect(partial, cfg)
+        with mock_patch.object(linux_backend, "list_windows", return_value=windows):
+            with self.assertRaises(models.ExcludedWindowError):
+                linux_backend.capture_region_rect(partial, cfg)
+
 
 class EphemeralStoreAndLifecycleTests(unittest.TestCase):
     def setUp(self) -> None:
