@@ -56,6 +56,137 @@ class _BLENDFUNCTION(ctypes.Structure):
     ]
 
 
+def configure_overlay_ctypes(windll: Any | None = None) -> None:
+    """Declare explicit 64-bit-safe ctypes argtypes/restype for overlay Win32/GDI calls."""
+    import ctypes.wintypes as wintypes
+
+    dll_root = windll if windll is not None else getattr(ctypes, "windll", None)
+    if dll_root is None:
+        return
+
+    user32 = dll_root.user32
+    gdi32 = dll_root.gdi32
+    kernel32 = dll_root.kernel32
+    msimg32 = getattr(dll_root, "msimg32", None)
+    shcore = getattr(dll_root, "shcore", None)
+
+    kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+
+    if hasattr(user32, "SetProcessDpiAwarenessContext"):
+        user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        user32.SetProcessDpiAwarenessContext.restype = ctypes.c_void_p
+    if shcore is not None and hasattr(shcore, "SetProcessDpiAwareness"):
+        shcore.SetProcessDpiAwareness.argtypes = [ctypes.c_int]
+        shcore.SetProcessDpiAwareness.restype = ctypes.c_long
+
+    user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+    user32.GetSystemMetrics.restype = ctypes.c_int
+    user32.GetDC.argtypes = [wintypes.HWND]
+    user32.GetDC.restype = wintypes.HDC
+    user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+    user32.ReleaseDC.restype = ctypes.c_int
+    user32.FillRect.argtypes = [wintypes.HDC, ctypes.POINTER(wintypes.RECT), wintypes.HBRUSH]
+    user32.FillRect.restype = ctypes.c_int
+    user32.FrameRect.argtypes = [wintypes.HDC, ctypes.POINTER(wintypes.RECT), wintypes.HBRUSH]
+    user32.FrameRect.restype = ctypes.c_int
+    user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+    user32.GetCursorPos.restype = wintypes.BOOL
+    user32.DrawTextW.argtypes = [
+        wintypes.HDC, wintypes.LPCWSTR, ctypes.c_int, ctypes.POINTER(wintypes.RECT), wintypes.UINT,
+    ]
+    user32.DrawTextW.restype = ctypes.c_int
+    user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.DefWindowProcW.restype = ctypes.c_ssize_t
+    user32.LoadCursorW.argtypes = [wintypes.HINSTANCE, ctypes.c_void_p]
+    user32.LoadCursorW.restype = wintypes.HANDLE
+    user32.SetCursor.argtypes = [wintypes.HANDLE]
+    user32.SetCursor.restype = wintypes.HANDLE
+    user32.BeginPaint.argtypes = [wintypes.HWND, ctypes.c_void_p]
+    user32.BeginPaint.restype = wintypes.HDC
+    user32.EndPaint.argtypes = [wintypes.HWND, ctypes.c_void_p]
+    user32.EndPaint.restype = wintypes.BOOL
+    user32.DestroyWindow.argtypes = [wintypes.HWND]
+    user32.DestroyWindow.restype = wintypes.BOOL
+    user32.SetCapture.argtypes = [wintypes.HWND]
+    user32.SetCapture.restype = wintypes.HWND
+    user32.ReleaseCapture.argtypes = []
+    user32.ReleaseCapture.restype = wintypes.BOOL
+    user32.PostQuitMessage.argtypes = [ctypes.c_int]
+    user32.PostQuitMessage.restype = None
+    user32.RegisterClassExW.argtypes = [ctypes.c_void_p]
+    user32.RegisterClassExW.restype = wintypes.ATOM
+    user32.CreateWindowExW.argtypes = [
+        wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID,
+    ]
+    user32.CreateWindowExW.restype = wintypes.HWND
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.ShowWindow.restype = wintypes.BOOL
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+    user32.SetFocus.argtypes = [wintypes.HWND]
+    user32.SetFocus.restype = wintypes.HWND
+    user32.GetMessageW.argtypes = [
+        ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT,
+    ]
+    user32.GetMessageW.restype = ctypes.c_int
+    user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    user32.TranslateMessage.restype = wintypes.BOOL
+    user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    user32.DispatchMessageW.restype = ctypes.c_ssize_t
+    user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
+    user32.UnregisterClassW.restype = wintypes.BOOL
+
+    gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+    gdi32.CreateCompatibleDC.restype = wintypes.HDC
+    gdi32.CreateCompatibleBitmap.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int]
+    gdi32.CreateCompatibleBitmap.restype = wintypes.HBITMAP
+    gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
+    gdi32.SelectObject.restype = wintypes.HGDIOBJ
+    gdi32.BitBlt.argtypes = [
+        wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        wintypes.HDC, ctypes.c_int, ctypes.c_int, wintypes.DWORD,
+    ]
+    gdi32.BitBlt.restype = wintypes.BOOL
+    gdi32.GetStockObject.argtypes = [ctypes.c_int]
+    gdi32.GetStockObject.restype = wintypes.HGDIOBJ
+    gdi32.CreateSolidBrush.argtypes = [wintypes.COLORREF]
+    gdi32.CreateSolidBrush.restype = wintypes.HBRUSH
+    gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+    gdi32.DeleteObject.restype = wintypes.BOOL
+    gdi32.DeleteDC.argtypes = [wintypes.HDC]
+    gdi32.DeleteDC.restype = wintypes.BOOL
+    gdi32.GetDIBits.argtypes = [
+        wintypes.HDC, wintypes.HBITMAP, wintypes.UINT, wintypes.UINT,
+        wintypes.LPVOID, ctypes.c_void_p, wintypes.UINT,
+    ]
+    gdi32.GetDIBits.restype = ctypes.c_int
+    gdi32.CreateFontW.argtypes = [
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+        wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.LPCWSTR,
+    ]
+    gdi32.CreateFontW.restype = wintypes.HFONT
+    gdi32.SetBkMode.argtypes = [wintypes.HDC, ctypes.c_int]
+    gdi32.SetBkMode.restype = ctypes.c_int
+    gdi32.SetTextColor.argtypes = [wintypes.HDC, wintypes.COLORREF]
+    gdi32.SetTextColor.restype = wintypes.COLORREF
+
+    if msimg32 is not None and hasattr(msimg32, "AlphaBlend"):
+        msimg32.AlphaBlend.argtypes = [
+            wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            _BLENDFUNCTION,
+        ]
+        msimg32.AlphaBlend.restype = wintypes.BOOL
+
+
+if sys.platform == "win32":
+    configure_overlay_ctypes()
+
+
 def _window_at(sx: int, sy: int, windows_meta: list[dict[str, Any]]) -> dict[str, Any] | None:
     """Return the topmost visible window containing virtual-screen coordinates (sx, sy)."""
     for w in windows_meta:
@@ -120,6 +251,7 @@ def _resolve_snip_release(
 
 
 def _run_win32_snip(shots_dir: Path, max_dim: int, windows_meta: list[dict[str, Any]]) -> dict[str, Any]:
+    configure_overlay_ctypes()
     user32 = ctypes.windll.user32
     gdi32 = ctypes.windll.gdi32
     kernel32 = ctypes.windll.kernel32

@@ -30,6 +30,48 @@ from .store import STORE, emit_plugin_event, get_data_dir
 
 logger = logging.getLogger(__name__)
 
+
+def configure_hotkey_ctypes(windll: Any | None = None) -> None:
+    """Declare explicit 64-bit-safe ctypes argtypes/restype for hotkey Win32 calls."""
+    import ctypes.wintypes as wintypes
+
+    dll_root = windll if windll is not None else getattr(ctypes, "windll", None)
+    if dll_root is None:
+        return
+
+    user32 = dll_root.user32
+    kernel32 = dll_root.kernel32
+
+    kernel32.GetCurrentThreadId.argtypes = []
+    kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+    user32.PostThreadMessageW.argtypes = [
+        wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+    ]
+    user32.PostThreadMessageW.restype = wintypes.BOOL
+    user32.RegisterHotKey.argtypes = [
+        wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT,
+    ]
+    user32.RegisterHotKey.restype = wintypes.BOOL
+    user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.UnregisterHotKey.restype = wintypes.BOOL
+    user32.PeekMessageW.argtypes = [
+        ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT, wintypes.UINT,
+    ]
+    user32.PeekMessageW.restype = wintypes.BOOL
+    user32.GetMessageW.argtypes = [
+        ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT,
+    ]
+    user32.GetMessageW.restype = ctypes.c_int
+    user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    user32.TranslateMessage.restype = wintypes.BOOL
+    user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    user32.DispatchMessageW.restype = ctypes.c_ssize_t
+
+
+if sys.platform == "win32":
+    configure_hotkey_ctypes()
+
 WM_HOTKEY = 0x0312
 WM_APP_RELOAD = 0x8001
 WM_APP_STOP = 0x8002
@@ -212,6 +254,7 @@ class GlobalHotkeyManager:
             return self.ensure_started()
         if tid:
             try:
+                configure_hotkey_ctypes()
                 ctypes.windll.user32.PostThreadMessageW(wt.DWORD(tid), WM_APP_RELOAD, 0, 0)
                 time.sleep(0.05)
             except Exception:
@@ -228,6 +271,7 @@ class GlobalHotkeyManager:
             self._thread = None
         if sys.platform == "win32" and tid:
             try:
+                configure_hotkey_ctypes()
                 ctypes.windll.user32.PostThreadMessageW(wt.DWORD(tid), WM_APP_STOP, 0, 0)
             except Exception:
                 pass
@@ -339,6 +383,7 @@ class GlobalHotkeyManager:
             self._busy.release()
 
     def _loop(self, ready_evt: threading.Event) -> None:
+        configure_hotkey_ctypes()
         user32 = ctypes.windll.user32
         kernel32 = ctypes.windll.kernel32
         msg = wt.MSG()

@@ -930,6 +930,60 @@ class HotkeyAndSurfaceTests(unittest.TestCase):
                 else:
                     os.environ["HERMES_HOME"] = prev_home
 
+    def test_win32_ctypes_configure_explicit_64bit_signatures(self) -> None:
+        import ctypes
+        import ctypes.wintypes as wintypes
+        from types import SimpleNamespace
+        from lat.capture.win32_backend import configure_win32_ctypes
+        from lat.capture.win32_overlay import _BLENDFUNCTION, configure_overlay_ctypes
+        from lat.hotkey_daemon import configure_hotkey_ctypes
+
+        class FakeFn:
+            argtypes = None
+            restype = None
+
+        class FakeDll:
+            def __getattr__(self, name: str) -> FakeFn:
+                fn = FakeFn()
+                setattr(self, name, fn)
+                return fn
+
+        fake_windll = SimpleNamespace(
+            user32=FakeDll(),
+            gdi32=FakeDll(),
+            kernel32=FakeDll(),
+            dwmapi=FakeDll(),
+            msimg32=FakeDll(),
+            shcore=FakeDll(),
+        )
+        configure_win32_ctypes(fake_windll)
+        configure_overlay_ctypes(fake_windll)
+        configure_hotkey_ctypes(fake_windll)
+
+        self.assertIs(fake_windll.user32.GetDC.restype, wintypes.HDC)
+        self.assertIs(fake_windll.user32.GetForegroundWindow.restype, wintypes.HWND)
+        self.assertIs(fake_windll.user32.CreateWindowExW.restype, wintypes.HWND)
+        self.assertIs(fake_windll.user32.DefWindowProcW.restype, ctypes.c_ssize_t)
+        self.assertIs(fake_windll.user32.LoadCursorW.restype, wintypes.HANDLE)
+        self.assertIs(fake_windll.gdi32.CreateCompatibleDC.restype, wintypes.HDC)
+        self.assertIs(fake_windll.gdi32.CreateCompatibleBitmap.restype, wintypes.HBITMAP)
+        self.assertIs(fake_windll.gdi32.SelectObject.restype, wintypes.HGDIOBJ)
+        self.assertIs(fake_windll.gdi32.CreateSolidBrush.restype, wintypes.HBRUSH)
+        self.assertIs(fake_windll.gdi32.CreateFontW.restype, wintypes.HFONT)
+        self.assertIs(fake_windll.kernel32.OpenProcess.restype, wintypes.HANDLE)
+        self.assertIs(fake_windll.kernel32.GetModuleHandleW.restype, wintypes.HMODULE)
+        self.assertIs(fake_windll.msimg32.AlphaBlend.argtypes[-1], _BLENDFUNCTION)
+        self.assertIs(fake_windll.user32.PostThreadMessageW.restype, wintypes.BOOL)
+        self.assertIs(fake_windll.user32.RegisterHotKey.restype, wintypes.BOOL)
+
+        if sys.platform == "win32":
+            configure_win32_ctypes()
+            configure_overlay_ctypes()
+            configure_hotkey_ctypes()
+            self.assertIs(ctypes.windll.user32.GetDC.restype, wintypes.HDC)
+            self.assertIs(ctypes.windll.gdi32.SelectObject.restype, wintypes.HGDIOBJ)
+            self.assertIs(ctypes.windll.user32.RegisterHotKey.restype, wintypes.BOOL)
+
     def test_desktop_plugin_contract(self) -> None:
         src = (ROOT / "desktop" / "plugin.js").read_text(encoding="utf-8")
         self.assertIn("focusedStoredSessionId", src)

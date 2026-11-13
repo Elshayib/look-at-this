@@ -85,6 +85,164 @@ class _BITMAPINFO(ctypes.Structure):
     _fields_ = [("bmiHeader", _BITMAPINFOHEADER), ("bmiColors", ctypes.c_uint32 * 3)]
 
 
+WNDENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM) if sys.platform == "win32" else None
+
+
+def configure_win32_ctypes(windll: Any | None = None) -> None:
+    """Declare explicit 64-bit-safe ctypes argtypes/restype for all Win32/GDI/DWM calls."""
+    import ctypes.wintypes as wintypes
+
+    dll_root = windll if windll is not None else getattr(ctypes, "windll", None)
+    if dll_root is None:
+        return
+
+    enum_cb_type = WNDENUMPROC or ctypes.CFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    user32 = dll_root.user32
+    gdi32 = dll_root.gdi32
+    kernel32 = dll_root.kernel32
+    dwmapi = getattr(dll_root, "dwmapi", None)
+
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.GetCurrentThreadId.argtypes = []
+    kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+    kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+
+    if dwmapi is not None:
+        dwmapi.DwmGetWindowAttribute.argtypes = [
+            wintypes.HWND, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+        ]
+        dwmapi.DwmGetWindowAttribute.restype = ctypes.c_long
+
+    if hasattr(user32, "SetThreadDpiAwarenessContext"):
+        user32.SetThreadDpiAwarenessContext.argtypes = [ctypes.c_void_p]
+        user32.SetThreadDpiAwarenessContext.restype = ctypes.c_void_p
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    user32.GetWindowRect.restype = wintypes.BOOL
+    user32.GetForegroundWindow.argtypes = []
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    if hasattr(user32, "GetAncestor"):
+        user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.GetAncestor.restype = wintypes.HWND
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.GetDC.argtypes = [wintypes.HWND]
+    user32.GetDC.restype = wintypes.HDC
+    user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+    user32.ReleaseDC.restype = ctypes.c_int
+    user32.PrintWindow.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
+    user32.PrintWindow.restype = wintypes.BOOL
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.IsIconic.argtypes = [wintypes.HWND]
+    user32.IsIconic.restype = wintypes.BOOL
+    user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.GetWindowLongW.restype = ctypes.c_long
+    user32.EnumWindows.argtypes = [enum_cb_type, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
+    user32.EnumChildWindows.argtypes = [wintypes.HWND, enum_cb_type, wintypes.LPARAM]
+    user32.EnumChildWindows.restype = wintypes.BOOL
+    user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.ShowWindow.restype = wintypes.BOOL
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+    user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+    user32.AttachThreadInput.restype = wintypes.BOOL
+    user32.BringWindowToTop.argtypes = [wintypes.HWND]
+    user32.BringWindowToTop.restype = wintypes.BOOL
+    user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+    user32.GetSystemMetrics.restype = ctypes.c_int
+    user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+    user32.DefWindowProcW.restype = ctypes.c_ssize_t
+    user32.BeginPaint.argtypes = [wintypes.HWND, ctypes.c_void_p]
+    user32.BeginPaint.restype = wintypes.HDC
+    user32.EndPaint.argtypes = [wintypes.HWND, ctypes.c_void_p]
+    user32.EndPaint.restype = wintypes.BOOL
+    user32.FillRect.argtypes = [wintypes.HDC, ctypes.POINTER(wintypes.RECT), wintypes.HBRUSH]
+    user32.FillRect.restype = ctypes.c_int
+    user32.FrameRect.argtypes = [wintypes.HDC, ctypes.POINTER(wintypes.RECT), wintypes.HBRUSH]
+    user32.FrameRect.restype = ctypes.c_int
+    user32.DrawTextW.argtypes = [
+        wintypes.HDC, wintypes.LPCWSTR, ctypes.c_int, ctypes.POINTER(wintypes.RECT), wintypes.UINT,
+    ]
+    user32.DrawTextW.restype = ctypes.c_int
+    user32.RegisterClassExW.argtypes = [ctypes.c_void_p]
+    user32.RegisterClassExW.restype = wintypes.ATOM
+    user32.CreateWindowExW.argtypes = [
+        wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID,
+    ]
+    user32.CreateWindowExW.restype = wintypes.HWND
+    user32.SetLayeredWindowAttributes.argtypes = [
+        wintypes.HWND, wintypes.COLORREF, wintypes.BYTE, wintypes.DWORD,
+    ]
+    user32.SetLayeredWindowAttributes.restype = wintypes.BOOL
+    user32.UpdateWindow.argtypes = [wintypes.HWND]
+    user32.UpdateWindow.restype = wintypes.BOOL
+    user32.PeekMessageW.argtypes = [
+        ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT, wintypes.UINT,
+    ]
+    user32.PeekMessageW.restype = wintypes.BOOL
+    user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    user32.TranslateMessage.restype = wintypes.BOOL
+    user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    user32.DispatchMessageW.restype = ctypes.c_ssize_t
+    user32.DestroyWindow.argtypes = [wintypes.HWND]
+    user32.DestroyWindow.restype = wintypes.BOOL
+    user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
+    user32.UnregisterClassW.restype = wintypes.BOOL
+
+    gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
+    gdi32.CreateCompatibleDC.restype = wintypes.HDC
+    gdi32.CreateCompatibleBitmap.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int]
+    gdi32.CreateCompatibleBitmap.restype = wintypes.HBITMAP
+    gdi32.SelectObject.argtypes = [wintypes.HDC, wintypes.HGDIOBJ]
+    gdi32.SelectObject.restype = wintypes.HGDIOBJ
+    gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+    gdi32.DeleteObject.restype = wintypes.BOOL
+    gdi32.DeleteDC.argtypes = [wintypes.HDC]
+    gdi32.DeleteDC.restype = wintypes.BOOL
+    gdi32.BitBlt.argtypes = [
+        wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        wintypes.HDC, ctypes.c_int, ctypes.c_int, wintypes.DWORD,
+    ]
+    gdi32.BitBlt.restype = wintypes.BOOL
+    gdi32.GetDIBits.argtypes = [
+        wintypes.HDC, wintypes.HBITMAP, wintypes.UINT, wintypes.UINT,
+        wintypes.LPVOID, ctypes.c_void_p, wintypes.UINT,
+    ]
+    gdi32.GetDIBits.restype = ctypes.c_int
+    gdi32.CreateSolidBrush.argtypes = [wintypes.COLORREF]
+    gdi32.CreateSolidBrush.restype = wintypes.HBRUSH
+    gdi32.CreateFontW.argtypes = [
+        ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+        wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.LPCWSTR,
+    ]
+    gdi32.CreateFontW.restype = wintypes.HFONT
+    gdi32.SetBkMode.argtypes = [wintypes.HDC, ctypes.c_int]
+    gdi32.SetBkMode.restype = ctypes.c_int
+    gdi32.SetTextColor.argtypes = [wintypes.HDC, wintypes.COLORREF]
+    gdi32.SetTextColor.restype = wintypes.COLORREF
+
+
+if sys.platform == "win32":
+    configure_win32_ctypes()
+
+
 @contextmanager
 def _per_monitor_dpi_thread() -> Iterator[None]:
     """Temporarily switch ONLY the calling thread to Per-Monitor-V2 DPI awareness."""
@@ -306,7 +464,7 @@ def _child_texts_fallback(hwnd: int, limit: int = 16) -> list[str]:
     user32 = ctypes.windll.user32
     items: list[str] = []
     seen: set[str] = set()
-    ENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+    enum_proc = WNDENUMPROC or ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
 
     def _cb(child: int, _lp: int) -> bool:
         if len(items) >= limit:
@@ -318,7 +476,7 @@ def _child_texts_fallback(hwnd: int, limit: int = 16) -> list[str]:
                 items.append(txt)
         return True
 
-    cb = ENUMPROC(_cb)
+    cb = enum_proc(_cb)
     user32.EnumChildWindows(wt.HWND(hwnd), cb, 0)
     return items
 
@@ -339,7 +497,7 @@ def list_windows(
         WS_EX_APPWINDOW = 0x00040000
         WS_EX_NOACTIVATE = 0x08000000
 
-        ENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+        enum_proc = WNDENUMPROC or ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
         z_counter = 0
 
         def _enum_cb(hwnd: int, _lp: int) -> bool:
@@ -382,7 +540,7 @@ def list_windows(
             results.append(info)
             return True
 
-        cb = ENUMPROC(_enum_cb)
+        cb = enum_proc(_enum_cb)
         user32.EnumWindows(cb, 0)
 
         # Mark topmost non-excluded window as the default active target
@@ -710,7 +868,7 @@ def focus_hermes_window() -> bool:
     kernel32 = ctypes.windll.kernel32
     target_hwnd = 0
 
-    ENUMPROC = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+    enum_proc = WNDENUMPROC or ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
 
     def _find_cb(hwnd: int, _lp: int) -> bool:
         nonlocal target_hwnd
@@ -727,7 +885,7 @@ def focus_hermes_window() -> bool:
             return False
         return True
 
-    cb = ENUMPROC(_find_cb)
+    cb = enum_proc(_find_cb)
     user32.EnumWindows(cb, 0)
     if not target_hwnd:
         return False
