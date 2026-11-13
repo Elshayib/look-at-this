@@ -2,7 +2,7 @@
   "name": "look-at-this",
   "label": "Look At This",
   "description": "Seamless ephemeral window, picker, and screen-region context for Hermes.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "icon": "ScreenFull",
   "api": "plugin_api.py"
 }

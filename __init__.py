@@ -9,6 +9,8 @@ from pathlib import Path
 from .lat import api_handlers, hotkey_daemon, surfaces
 from .lat.capture import uia_worker
 
+__version__ = "0.2.1"
+
 logger = logging.getLogger(__name__)
 
 

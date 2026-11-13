@@ -12,9 +12,9 @@ Nothing is captured until you ask. Screenshots are injected **ephemerally** into
 
 - **Instant Native Capture (<100 ms on Windows 11)** — Uses per-thread DPI-aware Win32 `PrintWindow(PW_RENDERFULLCONTENT)` + `DwmGetWindowAttribute` + a warm UIAutomation reader and pure-stdlib PNG encoder. Zero `cua-driver` requirement, zero cold-start lag, and automatic filtering of invisible DWM-cloaked UWP shell windows.
 - **Three Capture Modes**:
-  1. **Active Window (`Ctrl+Alt+L`)** — Captures the foreground window you are working in (or the window directly beneath Hermes), flashes a brief non-activating top-center HUD confirmation pill (`hotkey_hud_feedback`), and brings Hermes Desktop straight to focus.
-  2. **Interactive Snip & Window-Hover Overlay (`Ctrl+Alt+S`)** — Freezes a hardware-accelerated GDI canvas across all monitors: click any highlighted window to capture it cleanly, or drag a crosshair rectangle to snip any custom screen region.
-  3. **Interactive Window Picker (`Ctrl+Alt+W` / `+ → Pick a window to attach…` / `/look pick`)** — Searchable grid of open windows with live preview thumbnails.
+  1. **Active Window (`Ctrl+Alt+L` global on Windows / in-app on macOS & Linux)** — Captures the foreground window you are working in (or the window directly beneath Hermes), flashes a brief non-activating top-center HUD confirmation pill (`hotkey_hud_feedback`), and brings Hermes Desktop straight to focus (configurable via `window_hotkey`).
+  2. **Interactive Snip & Window-Hover Overlay (`Ctrl+Alt+S` global on Windows / in-app on macOS & Linux)** — Freezes a hardware-accelerated GDI canvas across all monitors: click any highlighted window to capture it cleanly, or drag a crosshair rectangle to snip any custom screen region (configurable via `snip_hotkey`).
+  3. **Interactive Window Picker (`Ctrl/Cmd+Alt+W` in-app shortcut `look-at-this.pick-window` / `+ → Pick a window to attach…` / `/look pick`)** — Searchable grid of open windows with live preview thumbnails.
 - **Configurable Hotkey Destination (`hotkey_target`)**:
   - `new_session` *(default)* — Automatically opens a fresh Hermes session with the capture attached so hotkey grabs never interrupt or leak into an existing chat.
   - `ask` — Opens the **"Where should this screen capture go?"** modal so you can pick **New session**, **Current chat**, or any recent session (plus a 1-click default switcher).
@@ -31,8 +31,8 @@ Nothing is captured until you ask. Screenshots are injected **ephemerally** into
 
 | Surface | How to Use |
 |---|---|
-| **Anywhere on OS (Windows)** | Press **`Ctrl+Alt+L`** to grab the active window or **`Ctrl+Alt+S`** to snip a region / click a window — Hermes Desktop comes straight to focus with your capture queued. |
-| **Hermes Desktop** | Click **`Look`** in the bottom status bar, click **`+`** in the composer, press **`Ctrl/Cmd+Alt+L`** / **`S`** / **`W`**, or open the Command Palette (`Ctrl/Cmd+K`). |
+| **Anywhere on OS (Windows)** | Press **`Ctrl+Alt+L`** (`window_hotkey`) to grab the active window or **`Ctrl+Alt+S`** (`snip_hotkey`) to snip a region / click a window — Hermes Desktop comes straight to focus with your capture queued. |
+| **Hermes Desktop** | Click **`Look`** in the bottom status bar, click **`+`** in the composer, press in-app shortcuts (**`Ctrl/Cmd+Alt+L`** / **`S`** / **`Ctrl/Cmd+Alt+W`** `look-at-this.pick-window`), or open the Command Palette (`Ctrl/Cmd+K`). |
 | **CLI / TUI / Messaging** | Run `/look`, `/look pick`, `/look snip`, `/look app=chrome`, `/look redact`, `/look tree`, `/look status`, or `/look clear`. |
 | **Agent Tools** | Ask *"what does this error on my screen mean?"* — the agent can call `lat_grab` or `lat_windows` on demand. |
 

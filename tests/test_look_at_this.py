@@ -1537,6 +1537,35 @@ class HotkeyAndSurfaceTests(unittest.TestCase):
         self.assertIn("PacketInspectorDialog", src)
         self.assertIn("!composerMounted", src)
 
+    def test_manifest_version_sync_and_desktop_js_syntax(self) -> None:
+        import re
+        import shutil
+        import subprocess
+        import lat
+
+        plugin_yaml = (ROOT / "plugin.yaml").read_text(encoding="utf-8")
+        skill_md = (ROOT / "skills" / "look-at-this" / "SKILL.md").read_text(encoding="utf-8")
+        root_init = (ROOT / "__init__.py").read_text(encoding="utf-8")
+        manifest = json.loads((ROOT / "dashboard" / "manifest.json").read_text(encoding="utf-8"))
+
+        v_yaml = re.search(r"^version:\s*(\S+)", plugin_yaml, re.M).group(1)  # type: ignore[union-attr]
+        v_skill = re.search(r"^version:\s*(\S+)", skill_md, re.M).group(1)  # type: ignore[union-attr]
+        v_root = re.search(r'__version__\s*=\s*"([^"]+)"', root_init).group(1)  # type: ignore[union-attr]
+        v_manifest = manifest["version"]
+        v_lat = lat.__version__
+
+        self.assertEqual({v_yaml, v_skill, v_root, v_manifest, v_lat}, {"0.2.1"})
+
+        node = shutil.which("node")
+        if node:
+            res = subprocess.run(
+                [node, "--check", str(ROOT / "desktop" / "plugin.js")],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Run Python unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Validate Desktop plugin JavaScript syntax
+        run: node --check desktop/plugin.js
+
+      - name: Verify manifest version sync
+        shell: python
+        run: |
+          import json
+          import pathlib
+          import re
+
+          plugin_yaml = pathlib.Path("plugin.yaml").read_text(encoding="utf-8")
+          skill_md = pathlib.Path("skills/look-at-this/SKILL.md").read_text(encoding="utf-8")
+          root_init = pathlib.Path("__init__.py").read_text(encoding="utf-8")
+          lat_init = pathlib.Path("lat/__init__.py").read_text(encoding="utf-8")
+          manifest = json.loads(pathlib.Path("dashboard/manifest.json").read_text(encoding="utf-8"))
+
+          v_yaml = re.search(r"^version:\s*(\S+)", plugin_yaml, re.M).group(1)
+          v_skill = re.search(r"^version:\s*(\S+)", skill_md, re.M).group(1)
+          v_root = re.search(r'__version__\s*=\s*"([^"]+)"', root_init).group(1)
+          v_lat = re.search(r'__version__\s*=\s*"([^"]+)"', lat_init).group(1)
+          v_manifest = manifest["version"]
+
+          versions = {v_yaml, v_skill, v_root, v_lat, v_manifest}
+          assert versions == {"0.2.1"}, f"Version mismatch: {versions}"
+          print(f"All manifest versions match: {v_yaml}")

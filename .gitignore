@@ -1,4 +1,17 @@
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
 .scratch/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.DS_Store
+Thumbs.db
+dist/
+build/
+*.egg-info/
