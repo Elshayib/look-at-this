@@ -442,6 +442,127 @@ class EphemeralStoreAndLifecycleTests(unittest.TestCase):
         self.assertIsNotNone(self.store.consume_for_turn("local-whoever", is_first_turn=False))
         self.store.finish_turn("local-whoever")
 
+    def test_multi_grab_turn_cleanup_non_destructive_tree_and_hotkey_clear(self) -> None:
+        from unittest import mock
+
+        shots = store.get_shots_dir()
+        shot_consumed = self._make_shot("lat_c1.png")
+        shot_inline_1 = self._make_shot("lat_i1.png")
+        shot_inline_2 = self._make_shot("lat_i2.png")
+        shot_inline_anon = self._make_shot("lat_ia.png")
+
+        raw_consumed = models.RawCapture(
+            capture_id="c1",
+            mode="window",
+            app="code.exe",
+            pid=1,
+            window_id=1,
+            title="Main",
+            bounds=models.RegionRect(0, 0, 100, 100),
+            screenshot_path=str(shot_consumed),
+            screenshot_width=16,
+            screenshot_height=12,
+        )
+        self.store.build_and_store(raw_consumed, models.Settings(), session_id="sess-multi")
+        self.assertIsNotNone(self.store.consume_for_turn("sess-multi"))
+
+        p1 = models.Packet(
+            id="i1", session_id="sess-multi", created_at=time.time(), expires_at=time.time() + 60,
+            mode="window", app="code.exe", pid=1, window_id=1, bounds=models.RegionRect(0, 0, 10, 10),
+            raw_title="A", raw_url=None, raw_selection=None, raw_context_text="", raw_tree_markdown="",
+            element_count=0, tree_truncated=False, screenshot_path=str(shot_inline_1),
+            screenshot_width=10, screenshot_height=10, thumbnail_data_url=None, fields=["screenshot"],
+        )
+        p2 = models.Packet(
+            id="i2", session_id="sess-multi", created_at=time.time(), expires_at=time.time() + 60,
+            mode="window", app="code.exe", pid=1, window_id=1, bounds=models.RegionRect(0, 0, 10, 10),
+            raw_title="B", raw_url=None, raw_selection=None, raw_context_text="", raw_tree_markdown="",
+            element_count=0, tree_truncated=False, screenshot_path=str(shot_inline_2),
+            screenshot_width=10, screenshot_height=10, thumbnail_data_url=None, fields=["screenshot"],
+        )
+        p3 = models.Packet(
+            id="i3", session_id="", created_at=time.time(), expires_at=time.time() + 60,
+            mode="window", app="code.exe", pid=1, window_id=1, bounds=models.RegionRect(0, 0, 10, 10),
+            raw_title="C", raw_url=None, raw_selection=None, raw_context_text="", raw_tree_markdown="",
+            element_count=0, tree_truncated=False, screenshot_path=str(shot_inline_anon),
+            screenshot_width=10, screenshot_height=10, thumbnail_data_url=None, fields=["screenshot"],
+        )
+        self.store.stage_inline_shot("sess-multi", p1)
+        self.store.stage_inline_shot("sess-multi", p2)
+        self.store.stage_inline_shot("inline", p3)
+
+        with mock.patch.object(surfaces, "STORE", self.store):
+            surfaces.hook_post_llm_call(session_id="sess-multi")
+        self.assertEqual(list(shots.glob("lat_*.png")), [])
+
+        # /look tree on on an unbound region packet must preserve mode, bounds, shot, id, and unbound slot
+        region_shot = shots / "lat_reg1.png"
+        region_shot.write_bytes(b"\x89PNG\r\n\x1a\n")
+        reg_raw = models.RawCapture(
+            capture_id="reg1",
+            mode="region",
+            app="code.exe",
+            pid=1,
+            window_id=77,
+            title="Region Capture",
+            bounds=models.RegionRect(10, 20, 300, 150),
+            screenshot_path=str(region_shot),
+            screenshot_width=300,
+            screenshot_height=150,
+        )
+        reg_pkt = self.store.build_and_store(
+            reg_raw, models.Settings(), session_id="", target_mode="any"
+        )
+        tree_raw = models.RawCapture(
+            capture_id="tree-only",
+            mode="window",
+            app="code.exe",
+            pid=1,
+            window_id=77,
+            title="Full Window",
+            bounds=models.RegionRect(0, 0, 1920, 1080),
+            tree_markdown="- [Window] \"Editor\"",
+            element_count=12,
+            tree_truncated=False,
+        )
+        with (
+            mock.patch.object(surfaces, "STORE", self.store),
+            mock.patch.object(surfaces.capture, "capture_window", return_value=tree_raw) as cap_mock,
+        ):
+            out = surfaces.handle_look_command("tree on", session_id="other-chat")
+
+        self.assertIn("Region", out)
+        cap_mock.assert_called_once()
+        _, kwargs = cap_mock.call_args
+        self.assertFalse(kwargs["include_screenshot"])
+        self.assertTrue(kwargs["include_tree"])
+        updated_ub = self.store.get_unbound_pending()
+        self.assertIsNotNone(updated_ub)
+        assert updated_ub is not None
+        self.assertEqual(updated_ub.id, reg_pkt.id)
+        self.assertEqual(updated_ub.mode, "region")
+        self.assertEqual(updated_ub.bounds, models.RegionRect(10, 20, 300, 150))
+        self.assertEqual(updated_ub.screenshot_path, str(region_shot))
+        self.assertIn("tree", updated_ub.fields)
+        self.assertIn("Editor", updated_ub.raw_tree_markdown)
+        self.store.clear_pending(packet_id=reg_pkt.id)
+
+        # Hotkey event must clear on retarget so window reloads don't replay stale routing
+        hk_raw = models.RawCapture(
+            capture_id="hkclr",
+            mode="window",
+            app="code.exe",
+            pid=1,
+            window_id=88,
+            title="Hotkey Window",
+            bounds=models.RegionRect(0, 0, 100, 100),
+        )
+        hk_pkt = self.store.build_and_store(hk_raw, models.Settings(), session_id="", target_mode="new_session")
+        self.store.record_hotkey_capture(hk_pkt, "new_session")
+        self.assertIsNotNone(self.store.get_last_hotkey_event())
+        self.store.retarget_pending(packet_id=hk_pkt.id, to_session_id="dest-chat")
+        self.assertIsNone(self.store.get_last_hotkey_event())
+
 
 class VisionInjectionTests(unittest.TestCase):
     def setUp(self) -> None:

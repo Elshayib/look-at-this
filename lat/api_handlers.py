@@ -203,6 +203,9 @@ def build_router() -> APIRouter:
             if current is None:
                 return {"ok": True, "pending": None}
 
+            raw_tree: str | None = None
+            el_count: int | None = None
+            tree_trunc: bool | None = None
             if fields and "tree" in fields and not current.raw_tree_markdown and current.window_id:
                 try:
                     refreshed = capture.capture_window(
@@ -211,10 +214,9 @@ def build_router() -> APIRouter:
                         include_screenshot=False,
                         include_tree=True,
                     )
-                    current.raw_tree_markdown = refreshed.tree_markdown
-                    current.element_count = refreshed.element_count
-                    current.tree_truncated = refreshed.tree_truncated
-                    STORE.put(current)
+                    raw_tree = refreshed.tree_markdown
+                    el_count = refreshed.element_count
+                    tree_trunc = refreshed.tree_truncated
                 except LookAtError:
                     pass
 
@@ -223,6 +225,9 @@ def build_router() -> APIRouter:
                 packet_id=current.id,
                 fields=fields,
                 redact_enabled=redact_enabled,
+                raw_tree_markdown=raw_tree,
+                element_count=el_count,
+                tree_truncated=tree_trunc,
             )
             return {
                 "ok": True,

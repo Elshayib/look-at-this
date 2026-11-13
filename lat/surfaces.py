@@ -223,9 +223,9 @@ def tool_lat_grab(args: dict[str, Any], session_id: str = "", **kwargs: Any) -> 
         )
         if not want_shot and raw.screenshot_path:
             safe_unlink_shot(raw.screenshot_path)
-        elif want_shot and pkt.screenshot_path and session_id:
+        elif want_shot and pkt.screenshot_path:
             # Stage for turn clean-up so inline tool PNGs are also auto-deleted at turn end!
-            STORE.stage_inline_shot(session_id, pkt)
+            STORE.stage_inline_shot(session_id or "inline", pkt)
 
         return _json_out({
             "ok": True,
@@ -337,11 +337,13 @@ def middleware_llm_request(
 def hook_post_llm_call(session_id: str = "", **kwargs: Any) -> None:
     if session_id:
         STORE.finish_turn(session_id)
+    STORE.finish_turn("inline")
 
 
 def hook_on_session_end(session_id: str = "", **kwargs: Any) -> None:
     if session_id:
         STORE.finish_turn(session_id)
+    STORE.finish_turn("inline")
     STORE.sweep_expired()
 
 
@@ -388,21 +390,30 @@ def handle_look_command(raw_args: str, session_id: str = "", platform: str = "",
             return "Look At This: no packet queued."
         req_fields = [v.strip().lower() for v in tokens[1].split(",") if v.strip()]
         next_fields = normalize_fields(req_fields)
+        raw_tree: str | None = None
+        el_count: int | None = None
+        tree_trunc: bool | None = None
         if "tree" in next_fields and not pkt.raw_tree_markdown and pkt.window_id:
             try:
                 raw = capture.capture_window(
                     cfg,
                     window_id=pkt.window_id,
-                    include_screenshot="screenshot" in next_fields,
+                    include_screenshot=False,
                     include_tree=True,
                 )
-                rebuilt = STORE.build_and_store(
-                    raw, cfg, session_id=session_id, fields=next_fields, redact=pkt.redact_enabled
-                )
-                return format_cli_preview(rebuilt)
+                raw_tree = raw.tree_markdown
+                el_count = raw.element_count
+                tree_trunc = raw.tree_truncated
             except LookAtError as exc:
                 return f"Look At This: {exc}"
-        updated = STORE.update_pending(session_id, fields=next_fields)
+        updated = STORE.update_pending(
+            session_id,
+            packet_id=pkt.id,
+            fields=next_fields,
+            raw_tree_markdown=raw_tree,
+            element_count=el_count,
+            tree_truncated=tree_trunc,
+        )
         return format_cli_preview(updated) if updated else "Look At This: packet expired."
 
     if first == "redact":
@@ -411,7 +422,7 @@ def handle_look_command(raw_args: str, session_id: str = "", platform: str = "",
             return "Look At This: no packet queued to toggle redaction on."
         arg = tokens[1].lower() if len(tokens) > 1 else ""
         next_val = (arg in {"on", "1", "true", "yes"}) if arg else (not pkt.redact_enabled)
-        updated = STORE.update_pending(session_id, redact_enabled=next_val)
+        updated = STORE.update_pending(session_id, packet_id=pkt.id, redact_enabled=next_val)
         return format_cli_preview(updated) if updated else "Look At This: packet expired."
 
     if first == "tree":
@@ -421,19 +432,20 @@ def handle_look_command(raw_args: str, session_id: str = "", platform: str = "",
         arg = tokens[1].lower() if len(tokens) > 1 else ""
         has_tree = "tree" in pkt.fields
         enable_tree = (arg in {"on", "1", "true", "yes"}) if arg else (not has_tree)
+        raw_tree: str | None = None
+        el_count: int | None = None
+        tree_trunc: bool | None = None
         if enable_tree and not pkt.raw_tree_markdown and pkt.window_id:
             try:
                 raw = capture.capture_window(
                     cfg,
                     window_id=pkt.window_id,
-                    include_screenshot="screenshot" in pkt.fields,
+                    include_screenshot=False,
                     include_tree=True,
                 )
-                fields = list(pkt.fields) + (["tree"] if "tree" not in pkt.fields else [])
-                rebuilt = STORE.build_and_store(
-                    raw, cfg, session_id=session_id, fields=fields, redact=pkt.redact_enabled
-                )
-                return format_cli_preview(rebuilt)
+                raw_tree = raw.tree_markdown
+                el_count = raw.element_count
+                tree_trunc = raw.tree_truncated
             except LookAtError as exc:
                 return f"Look At This: {exc}"
         next_fields = (
@@ -443,7 +455,14 @@ def handle_look_command(raw_args: str, session_id: str = "", platform: str = "",
         )
         if not next_fields:
             next_fields = ["context"]
-        updated = STORE.update_pending(session_id, fields=next_fields)
+        updated = STORE.update_pending(
+            session_id,
+            packet_id=pkt.id,
+            fields=next_fields,
+            raw_tree_markdown=raw_tree,
+            element_count=el_count,
+            tree_truncated=tree_trunc,
+        )
         return format_cli_preview(updated) if updated else "Look At This: packet expired."
 
     try:

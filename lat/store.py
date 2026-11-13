@@ -185,6 +185,9 @@ def emit_plugin_event(event: str, payload: dict[str, Any] | None = None) -> None
         pass
 
 
+_INITIALIZED_DBS: set[str] = set()
+
+
 class EphemeralStore:
     """Thread-safe, cross-process store backed by SQLite WAL."""
 
@@ -196,12 +199,88 @@ class EphemeralStore:
     def _connect(self) -> Iterator[sqlite3.Connection]:
         path = self._explicit_db_path if self._explicit_db_path is not None else (get_data_dir() / "data.db")
         path.parent.mkdir(parents=True, exist_ok=True)
+        resolved = str(path.resolve())
+        needs_init = (not path.exists()) or (resolved not in _INITIALIZED_DBS)
         raw_conn = sqlite3.connect(str(path), timeout=5.0, isolation_level=None)
         with closing(raw_conn) as conn:
-            conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.executescript(_SCHEMA_SQL)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA busy_timeout=3000")
+            if needs_init:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                conn.executescript(_SCHEMA_SQL)
+                _INITIALIZED_DBS.add(resolved)
             yield conn
+
+    @staticmethod
+    def _clear_last_hotkey_if_matches(conn: sqlite3.Connection, packet_id: str) -> None:
+        clean_pid = str(packet_id or "").strip()
+        if not clean_pid:
+            return
+        row = conn.execute(
+            "SELECT value FROM runtime_state WHERE key = ?",
+            ("last_hotkey_event",),
+        ).fetchone()
+        if not row:
+            return
+        try:
+            evt = json.loads(str(row[0] or ""))
+        except Exception:
+            conn.execute("DELETE FROM runtime_state WHERE key = ?", ("last_hotkey_event",))
+            return
+        if isinstance(evt, dict) and str(evt.get("packet_id") or "") == clean_pid:
+            conn.execute("DELETE FROM runtime_state WHERE key = ?", ("last_hotkey_event",))
+
+    @staticmethod
+    def _collect_turn_shots_from_json(raw_json: str) -> list[str]:
+        shots: list[str] = []
+        try:
+            data = json.loads(raw_json)
+        except Exception:
+            return shots
+        if not isinstance(data, dict):
+            return shots
+        main_shot = data.get("screenshot_path")
+        if isinstance(main_shot, str) and main_shot.strip():
+            shots.append(main_shot.strip())
+        extra = data.get("extra_screenshot_paths")
+        if isinstance(extra, list):
+            for p in extra:
+                if isinstance(p, str) and p.strip():
+                    shots.append(p.strip())
+        return shots
+
+    @classmethod
+    def _write_active_turn_payload(
+        cls,
+        conn: sqlite3.Connection,
+        session_id: str,
+        deadline: float,
+        pkt_dict: dict[str, Any],
+    ) -> None:
+        existing_row = conn.execute(
+            "SELECT payload_json FROM active_turns WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        prior_shots: list[str] = []
+        if existing_row:
+            prior_shots = cls._collect_turn_shots_from_json(str(existing_row[0] or ""))
+        current_main = str(pkt_dict.get("screenshot_path") or "").strip()
+        seen: set[str] = set()
+        if current_main:
+            seen.add(current_main)
+        merged_extra: list[str] = []
+        for s in prior_shots:
+            if s and s not in seen:
+                seen.add(s)
+                merged_extra.append(s)
+        if merged_extra:
+            pkt_dict["extra_screenshot_paths"] = merged_extra
+        conn.execute(
+            "INSERT INTO active_turns(session_id, expires_at, payload_json) VALUES (?, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET expires_at=excluded.expires_at, payload_json=excluded.payload_json",
+            (session_id, deadline, json.dumps(pkt_dict, ensure_ascii=False)),
+        )
 
     @staticmethod
     def _slot(session_id: str) -> str:
@@ -455,9 +534,16 @@ class EphemeralStore:
                 return None
             if not isinstance(evt, dict) or not evt.get("packet_id"):
                 return None
-            # Only surface if that packet is still pending (not already consumed or discarded)
+            # Only surface if that packet is still pending in the unbound slot
+            # (not already retargeted, consumed, or discarded)
             still_there = self._resolve_row(conn, "", packet_id=str(evt["packet_id"]))
             if not still_there:
+                return None
+            slot_key, pkt = still_there
+            if slot_key != UNBOUND_SESSION or pkt.session_id:
+                return None
+            hk_target = str(evt.get("hotkey_target") or "")
+            if hk_target in {"new_session", "ask"} and pkt.target_mode != hk_target:
                 return None
             return evt
 
@@ -514,6 +600,7 @@ class EphemeralStore:
                 "created_at=excluded.created_at, expires_at=excluded.expires_at, payload_json=excluded.payload_json",
                 (new_slot, pkt.id, pkt.session_id, pkt.created_at, pkt.expires_at, payload),
             )
+            self._clear_last_hotkey_if_matches(conn, pkt.id)
         if old_shot:
             safe_unlink_shot(old_shot)
         if new_sid:
@@ -539,6 +626,9 @@ class EphemeralStore:
         packet_id: str = "",
         fields: list[str] | None = None,
         redact_enabled: bool | None = None,
+        raw_tree_markdown: str | None = None,
+        element_count: int | None = None,
+        tree_truncated: bool | None = None,
     ) -> Packet | None:
         with self._lock, self._connect() as conn:
             found = self._resolve_row(
@@ -551,6 +641,12 @@ class EphemeralStore:
                 pkt.fields = normalize_fields(fields)
             if redact_enabled is not None:
                 pkt.redact_enabled = bool(redact_enabled)
+            if raw_tree_markdown is not None:
+                pkt.raw_tree_markdown = str(raw_tree_markdown)
+            if element_count is not None:
+                pkt.element_count = int(element_count)
+            if tree_truncated is not None:
+                pkt.tree_truncated = bool(tree_truncated)
             payload = json.dumps(pkt.to_storage_dict(), ensure_ascii=False)
             conn.execute(
                 "UPDATE pending_packets SET payload_json = ? WHERE slot_key = ?",
@@ -582,22 +678,19 @@ class EphemeralStore:
             pkt_session = pkt.session_id
             shot = pkt.screenshot_path
             conn.execute("DELETE FROM pending_packets WHERE slot_key = ?", (slot,))
+            self._clear_last_hotkey_if_matches(conn, pkt.id)
         safe_unlink_shot(shot)
         emit_plugin_event("state.changed", {"action": "cleared", "session_id": pkt_session, "pending": None})
         return True
 
     def stage_inline_shot(self, session_id: str, pkt: Packet) -> None:
         """Track an inline lat_grab screenshot so post_llm_call cleans it up after the turn."""
-        if not session_id or not pkt.screenshot_path:
+        clean_sid = str(session_id or "").strip()
+        if not clean_sid or not pkt.screenshot_path:
             return
         deadline = time.time() + 180.0
-        payload = json.dumps(pkt.to_storage_dict(), ensure_ascii=False)
         with self._lock, self._connect() as conn:
-            conn.execute(
-                "INSERT INTO active_turns(session_id, expires_at, payload_json) VALUES (?, ?, ?) "
-                "ON CONFLICT(session_id) DO UPDATE SET expires_at=excluded.expires_at, payload_json=excluded.payload_json",
-                (session_id, deadline, payload),
-            )
+            self._write_active_turn_payload(conn, clean_sid, deadline, pkt.to_storage_dict())
 
     def consume_for_turn(
         self,
@@ -668,13 +761,10 @@ class EphemeralStore:
             slot, pkt = found
             consumed_slot = slot
             conn.execute("DELETE FROM pending_packets WHERE slot_key = ?", (slot,))
+            self._clear_last_hotkey_if_matches(conn, pkt.id)
             if "screenshot" in pkt.fields and pkt.screenshot_path:
                 deadline = time.time() + 180.0
-                conn.execute(
-                    "INSERT INTO active_turns(session_id, expires_at, payload_json) VALUES (?, ?, ?) "
-                    "ON CONFLICT(session_id) DO UPDATE SET expires_at=excluded.expires_at, payload_json=excluded.payload_json",
-                    (clean_sid, deadline, json.dumps(pkt.to_storage_dict(), ensure_ascii=False)),
-                )
+                self._write_active_turn_payload(conn, clean_sid, deadline, pkt.to_storage_dict())
             else:
                 # Screenshot excluded by toggle -> delete immediately!
                 safe_unlink_shot(pkt.screenshot_path)
@@ -710,7 +800,8 @@ class EphemeralStore:
                 return None
             if expires_at <= now:
                 conn.execute("DELETE FROM active_turns WHERE session_id = ?", (session_id,))
-                safe_unlink_shot(pkt.screenshot_path)
+                for shot in set(self._collect_turn_shots_from_json(payload_json)):
+                    safe_unlink_shot(shot)
                 return None
             return pkt
 
@@ -724,12 +815,7 @@ class EphemeralStore:
                 "SELECT payload_json FROM active_turns WHERE session_id = ?", (session_id,)
             ).fetchone()
             if row:
-                try:
-                    db_pkt = Packet.from_storage_dict(json.loads(row[0]))
-                    if db_pkt.screenshot_path:
-                        shots.append(db_pkt.screenshot_path)
-                except Exception:
-                    pass
+                shots.extend(self._collect_turn_shots_from_json(str(row[0] or "")))
             conn.execute("DELETE FROM active_turns WHERE session_id = ?", (session_id,))
         for s in set(shots):
             safe_unlink_shot(s)
@@ -763,22 +849,24 @@ class EphemeralStore:
 
                 trows = conn.execute("SELECT session_id, expires_at, payload_json FROM active_turns").fetchall()
                 for tsid, texpires, tpayload in trows:
+                    turn_shots = self._collect_turn_shots_from_json(str(tpayload or ""))
                     try:
-                        tpkt = Packet.from_storage_dict(json.loads(tpayload))
+                        Packet.from_storage_dict(json.loads(tpayload))
                     except Exception:
                         conn.execute("DELETE FROM active_turns WHERE session_id = ?", (tsid,))
+                        expired_shots.extend(turn_shots)
                         removed += 1
                         continue
                     if float(texpires) <= now:
                         conn.execute("DELETE FROM active_turns WHERE session_id = ?", (tsid,))
-                        if tpkt.screenshot_path:
-                            expired_shots.append(tpkt.screenshot_path)
+                        expired_shots.extend(turn_shots)
                         removed += 1
-                    elif tpkt.screenshot_path:
-                        try:
-                            active_shots.add(Path(tpkt.screenshot_path).resolve())
-                        except OSError:
-                            pass
+                    else:
+                        for tshot in turn_shots:
+                            try:
+                                active_shots.add(Path(tshot).resolve())
+                            except OSError:
+                                pass
 
         for shot in expired_shots:
             safe_unlink_shot(shot)
