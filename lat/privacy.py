@@ -205,7 +205,11 @@ _TEXT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("private_key", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.S)),
     ("api_key", re.compile(r"\b(?:sk-(?:ant-|proj-)?[A-Za-z0-9_\-]{16,}|AIza[0-9A-Za-z_\-]{32,}|glpat-[A-Za-z0-9_\-]{16,})\b")),
     ("aws_key", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
-    ("github_token", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}\b")),
+    ("github_token", re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{22,})\b")),
+    ("hf_token", re.compile(r"\bhf_[A-Za-z0-9]{30,}\b")),
+    ("stripe_key", re.compile(r"\b(?:sk|rk)_live_[A-Za-z0-9]{20,}\b")),
+    ("npm_token", re.compile(r"\bnpm_[A-Za-z0-9]{30,}\b")),
+    ("pypi_token", re.compile(r"\bpypi-[A-Za-z0-9_\-]{30,}\b")),
     ("slack_token", re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}\b")),
     ("jwt", re.compile(r"\beyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}\b")),
     ("bearer_token", re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{16,}")),
@@ -252,6 +256,24 @@ def redact_text(text: str | None, counts: dict[str, int] | None = None) -> str |
     return out
 
 
+def _redact_kv_segment(segment: str, tally: dict[str, int]) -> str:
+    pairs = parse_qsl(segment, keep_blank_values=True)
+    if not pairs:
+        return segment
+    changed = 0
+    cleaned = []
+    for k, v in pairs:
+        if _SENSITIVE_QUERY_RE.match(k):
+            cleaned.append((k, "[REDACTED]"))
+            changed += 1
+        else:
+            cleaned.append((k, v))
+    if changed:
+        tally["url_param"] = tally.get("url_param", 0) + changed
+        return urlencode(cleaned, doseq=True)
+    return segment
+
+
 def redact_url(url: str | None, counts: dict[str, int] | None = None) -> str | None:
     if not url:
         return url
@@ -269,20 +291,16 @@ def redact_url(url: str | None, counts: dict[str, int] | None = None) -> str | N
         tally["url_auth"] = tally.get("url_auth", 0) + 1
 
     if parts.query:
-        pairs = parse_qsl(parts.query, keep_blank_values=True)
-        changed = 0
-        cleaned = []
-        for k, v in pairs:
-            if _SENSITIVE_QUERY_RE.match(k):
-                cleaned.append((k, "[REDACTED]"))
-                changed += 1
-            else:
-                cleaned.append((k, v))
-        if changed:
-            tally["url_param"] = tally.get("url_param", 0) + changed
-            parts = parts._replace(query=urlencode(cleaned, doseq=True))
+        parts = parts._replace(query=_redact_kv_segment(parts.query, tally))
 
-    return urlunsplit(parts)
+    if parts.fragment and "=" in parts.fragment:
+        if "?" in parts.fragment:
+            frag_prefix, frag_qs = parts.fragment.split("?", 1)
+            parts = parts._replace(fragment=f"{frag_prefix}?{_redact_kv_segment(frag_qs, tally)}")
+        else:
+            parts = parts._replace(fragment=_redact_kv_segment(parts.fragment, tally))
+
+    return redact_text(urlunsplit(parts), tally)
 
 
 def resolve_packet_texts(pkt: Packet) -> tuple[dict[str, str | None], dict[str, int], dict[str, int]]:
