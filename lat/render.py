@@ -1,4 +1,4 @@
-"""Context rendering and ephemeral multimodal vision injection for Look At This v2."""
+"""Context rendering and ephemeral multimodal vision injection for Look At This."""
 
 from __future__ import annotations
 

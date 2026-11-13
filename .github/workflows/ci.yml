@@ -56,5 +56,9 @@ jobs:
           v_manifest = manifest["version"]
 
           versions = {v_yaml, v_skill, v_root, v_lat, v_manifest}
-          assert versions == {"0.2.1"}, f"Version mismatch: {versions}"
-          print(f"All manifest versions match: {v_yaml}")
+          assert len(versions) == 1, f"Version mismatch: {versions}"
+          ver = next(iter(versions))
+          assert re.match(r"^\d+\.\d+\.\d+$", ver), f"Invalid semver version: {ver!r}"
+          for required in ("CONTRIBUTING.md", "SECURITY.md", "CHANGELOG.md", "CODE_OF_CONDUCT.md", "LICENSE"):
+              assert pathlib.Path(required).is_file(), f"Missing repository file: {required}"
+          print(f"All manifest versions match ({ver}) and community files exist.")

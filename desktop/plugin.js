@@ -1,5 +1,5 @@
 /**
- * Look At This v2 — Native Hermes Desktop Plugin (100% SDK-only).
+ * Look At This — Native Hermes Desktop Plugin (100% SDK-only).
  *
  * Surfaces:
  *   - Composer top preview card (accent-highlighted attachment banner, live thumbnail,
@@ -1774,6 +1774,7 @@ function SettingsOverviewPage() {
 
   const hotkeys = (statusQuery.data && statusQuery.data.hotkeys) || {}
   const settings = (statusQuery.data && statusQuery.data.settings) || {}
+  const version = (statusQuery.data && statusQuery.data.version) || '0.2.1'
   const warnings = hotkeys.warnings || []
 
   const reloadHotkeys = async () => {
@@ -1821,6 +1822,10 @@ function SettingsOverviewPage() {
                       : hotkeys.supported === false
                         ? 'In-App Shortcuts Mode'
                         : 'Standby'
+                  }),
+                  jsx(Badge, {
+                    variant: 'outline',
+                    children: `v${version}`
                   })
                 ]
               }),
@@ -1979,6 +1984,18 @@ function SettingsOverviewPage() {
           onClick: () =>
             void savePluginSettings({ include_full_tree_by_default: settings.include_full_tree_by_default !== true }),
           children: settings.include_full_tree_by_default === true ? 'Full Tree ON' : 'On Demand'
+        })
+      }),
+      jsx(Separator, {}),
+      jsx(ListRow, {
+        title: `Look At This v${version}`,
+        description:
+          'Update anytime via `hermes plugins update look-at-this`, `/plugins update` in chat, or Settings → Capabilities → Plugins.',
+        action: jsx(Button, {
+          size: 'sm',
+          variant: 'outline',
+          onClick: () => host.navigate('/settings?tab=plugins'),
+          children: 'Manage plugins'
         })
       })
     ]

@@ -1,0 +1,81 @@
+name: Bug Report
+description: Report a capture issue, hotkey problem, UI bug, or crash in Look At This.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting an issue with **Look At This**! Please fill out the details below so we can reproduce and fix it quickly.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: A clear, concise description of the bug.
+      placeholder: e.g., Snip overlay freezes when capturing a secondary portrait monitor...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System / Display Server
+      options:
+        - Windows 11
+        - Windows 10
+        - macOS
+        - Linux (Wayland)
+        - Linux (X11)
+        - Other
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: surfaces
+    attributes:
+      label: Affected Surface(s)
+      options:
+        - label: Hermes Desktop UI (Composer card, Picker, Settings)
+        - label: Global Hotkeys (Ctrl+Alt+L / Ctrl+Alt+S)
+        - label: CLI / TUI / Messaging (`/look`)
+        - label: Agent Tools (`lat_grab`, `lat_windows`, `lat_status`, `lat_clear`)
+        - label: Ephemeral Vision / Model Context Injection
+
+  - type: textarea
+    id: versions
+    attributes:
+      label: Look At This & Hermes Versions
+      description: Paste output of `/look version` or `hermes plugins list` and `hermes --version`.
+      placeholder: |
+        Look At This: v0.2.1
+        Hermes Agent: v0.22.6
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to Reproduce
+      description: Exact steps to trigger the issue.
+      placeholder: |
+        1. Press Ctrl+Alt+L on...
+        2. Switch to Hermes Desktop...
+        3. See error...
+    validations:
+      required: true
+
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected vs. Actual Behavior
+      description: What you expected to happen and what actually happened.
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostic Output & Logs
+      description: |
+        Optional but very helpful: output from `hermes plugins doctor look-at-this`, `/look status`, or `hermes plugins validate`.
+        **Remember to redact any sensitive URLs, titles, or tokens before pasting.**
+      render: text

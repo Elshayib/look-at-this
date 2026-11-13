@@ -4,7 +4,7 @@ description: "Use when the user says 'look at this', asks about an error or UI o
 version: 0.2.1
 ---
 
-# Look At This (v2)
+# Look At This
 
 The user can attach any window or screen region to their next message via global hotkeys
 (`Ctrl+Alt+L` active window, `Ctrl+Alt+S` interactive region/window snip), the Desktop
@@ -43,6 +43,12 @@ If the user asks about something on their screen without queuing a packet first:
   `vision_analyze`.
 - `lat_windows`: List currently visible windows (`window_id`, `app_display`, `title`, `bounds`).
 - `lat_status` / `lat_clear`: Inspect or discard a queued packet.
+
+## `/look` Slash Commands & Updating
+
+- `/look` (or `/look pick`, `/look snip`, `/look app=<query>`): capture and queue a window or region.
+- `/look status`, `/look redact [on|off]`, `/look tree [on|off]`, `/look clear`: inspect, adjust, or discard the queued packet.
+- `/look version` (alias `/look update`): show the installed plugin version and update commands (`hermes plugins update look-at-this` or `/plugins update`).
 
 ## Privacy Invariants
 

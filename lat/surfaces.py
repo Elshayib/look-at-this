@@ -9,12 +9,13 @@ import time
 from typing import Any, Callable
 import uuid
 
-from . import capture
+from . import __version__, capture
 from .models import (
     ALL_FIELDS,
     LookAtError,
     Packet,
     RegionRect,
+    SCHEMA_VERSION,
     Settings,
     load_live_settings,
     normalize_fields,
@@ -356,7 +357,7 @@ def hook_on_session_end(session_id: str = "", **kwargs: Any) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 LOOK_HELP = """\
-Look At This v2 — Ephemeral Screen & Window Context:
+Look At This — Ephemeral Screen & Window Context:
   /look                  Capture the active/underlying window for your next message
   /look pick             Pick from open visible windows interactively
   /look snip             Open interactive crosshair overlay (click window or drag region)
@@ -365,7 +366,22 @@ Look At This v2 — Ephemeral Screen & Window Context:
   /look tree [on|off]    Toggle full accessibility tree on the queued packet
   /look status           Inspect the currently queued packet
   /look clear            Discard the queued packet and delete its screenshot
+  /look version          Show installed version and how to update Look At This
   /look help             Show this help"""
+
+
+def _format_version_and_update_info() -> str:
+    return (
+        f"Look At This v{__version__} (schema {SCHEMA_VERSION})\n"
+        "Repository: https://github.com/Elshayib/look-at-this\n\n"
+        "How to update Look At This in Hermes:\n"
+        "  • Terminal CLI:    hermes plugins update look-at-this\n"
+        "  • Check updates:   hermes plugins check-updates\n"
+        "  • In-chat command: /plugins update\n"
+        "  • Auto-update:     hermes plugins auto-update on\n"
+        "  • Hermes Desktop:  Settings → Capabilities → Plugins → Look At This → Update\n"
+        "  • Manual clone:    hermes plugins adopt look-at-this  (run once, then update)"
+    )
 
 
 def handle_look_command(raw_args: str, session_id: str = "", platform: str = "", **kwargs: Any) -> str:
@@ -377,6 +393,9 @@ def handle_look_command(raw_args: str, session_id: str = "", platform: str = "",
 
     if first == "help":
         return LOOK_HELP
+
+    if first in {"version", "update", "-v", "--version"}:
+        return _format_version_and_update_info()
 
     if first == "status":
         pkt = STORE.get_pending(session_id)

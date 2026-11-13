@@ -1,4 +1,4 @@
-"""Authenticated gateway REST route handlers for Look At This v2.
+"""Authenticated gateway REST route handlers for Look At This.
 
 Shared by ``dashboard/plugin_api.py`` and live ``reload_gateway_plugins`` route
 hot-swapping so the HTTP API and the agent hooks always share one process-wide
@@ -14,7 +14,7 @@ from typing import Any
 from fastapi import APIRouter, Body, Query
 from fastapi.responses import JSONResponse
 
-from . import capture
+from . import __version__, capture
 from .hotkey_daemon import HOTKEYS, parse_hotkey_chord
 from .models import (
     ALL_FIELDS,
@@ -166,6 +166,7 @@ def build_router() -> APIRouter:
             last_hk = STORE.get_last_hotkey_event()
             return {
                 "ok": True,
+                "version": __version__,
                 "schema": SCHEMA_VERSION,
                 "platform": sys.platform,
                 "pending": format_public_packet(pkt, include_preview=bool(preview)) if pkt else None,

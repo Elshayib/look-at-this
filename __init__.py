@@ -1,4 +1,4 @@
-"""Look At This v2 — seamless ephemeral screen, window, and region context."""
+"""Look At This — seamless ephemeral screen, window, and region context."""
 
 from __future__ import annotations
 
@@ -94,7 +94,7 @@ def register(ctx) -> None:
         "look",
         surfaces.handle_look_command,
         description="Capture a window or screen region as an ephemeral context packet for your next message",
-        args_hint="[pick | snip | app=<name> | redact | tree | status | clear | help]",
+        args_hint="[pick | snip | app=<name> | redact | tree | status | clear | version | help]",
     )
 
     skills_dir = Path(__file__).parent / "skills"

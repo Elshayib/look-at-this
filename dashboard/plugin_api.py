@@ -1,4 +1,4 @@
-"""Look At This v2 — authenticated gateway REST routes for Hermes Desktop.
+"""Look At This — authenticated gateway REST routes for Hermes Desktop.
 
 Mounted at ``/api/plugins/look-at-this/`` behind the gateway's own auth.
 Delegates to the active ``hermes_plugins.look_at_this`` package when loaded in

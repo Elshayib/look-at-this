@@ -1,4 +1,4 @@
-"""Domain models, errors, and live configuration for Look At This v2."""
+"""Domain models, errors, and live configuration for Look At This."""
 
 from __future__ import annotations
 

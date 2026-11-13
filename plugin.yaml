@@ -7,6 +7,15 @@ description: >-
   ephemerally to vision models alongside smart UI context, URL, and selection.
 author: Elshayib
 license: MIT
+homepage: https://github.com/Elshayib/look-at-this
+tags:
+  - screen-capture
+  - screenshot
+  - vision
+  - desktop
+  - accessibility
+  - ui-context
+  - multimodal
 manifest_version: 2
 requires_hermes: ">=0.22.6"
 platforms:

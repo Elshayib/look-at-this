@@ -1,4 +1,4 @@
-"""In-process single-instance OS global hotkey manager for Look At This v2.
+"""In-process single-instance OS global hotkey manager for Look At This.
 
 Runs automatically inside ``hermes serve`` (started lazily by ``plugin_api.py``,
 never during ``hermes plugins validate`` or ``doctor``). Registers two system-wide

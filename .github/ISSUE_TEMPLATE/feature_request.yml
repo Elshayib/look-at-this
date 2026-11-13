@@ -1,0 +1,46 @@
+name: Feature Request
+description: Suggest a new capability, capture backend improvement, or workflow enhancement.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have an idea to make **Look At This** better? Share your workflow and proposal below.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or Workflow
+      description: What workflow or limitation are you trying to solve?
+      placeholder: I often capture multi-window layouts on Linux Wayland and want to...
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed Solution
+      description: How should Look At This behave? Mention any CLI flags, hotkeys, settings, or UI changes you envision.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: target
+    attributes:
+      label: Target Platform / Component
+      options:
+        - All Platforms
+        - Windows
+        - macOS
+        - Linux (Wayland / X11)
+        - Hermes Desktop UI
+        - CLI / `/look` Command
+        - Privacy & Redaction
+        - Vision & Model Integration
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional Context
+      description: Alternatives you've considered, screenshots, or links to relevant Hermes plugin APIs.

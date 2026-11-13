@@ -1,4 +1,4 @@
-"""Comprehensive unit & live host integration test suite for Look At This v2."""
+"""Comprehensive unit & live host integration test suite for Look At This."""
 
 from __future__ import annotations
 
@@ -216,7 +216,7 @@ class PrivacyAndRedactionTests(unittest.TestCase):
         self.assertIsNotNone(privacy.check_window_exclusion("firefox.exe", "Mozilla Firefox Private Browsing", cfg))
         self.assertIsNotNone(privacy.check_window_exclusion("msedge.exe", "InPrivate - Microsoft Edge", cfg))
 
-        # Crucial v2 fix: normal developer windows mentioning "password" or "unlock" are NOT falsely blocked!
+        # Normal developer windows mentioning "password" or "unlock" are NOT falsely blocked!
         self.assertIsNone(privacy.check_window_exclusion("Code.exe", "password_reset.py - MyProject - Visual Studio Code", cfg))
         self.assertIsNone(privacy.check_window_exclusion("chrome.exe", "Fix unlock modal bug · Issue #42 - Google Chrome", cfg))
 
@@ -1585,7 +1585,35 @@ class HotkeyAndSurfaceTests(unittest.TestCase):
         v_manifest = manifest["version"]
         v_lat = lat.__version__
 
-        self.assertEqual({v_yaml, v_skill, v_root, v_manifest, v_lat}, {"0.2.1"})
+        self.assertEqual({v_yaml, v_skill, v_root, v_manifest, v_lat}, {lat.__version__})
+        self.assertRegex(lat.__version__, r"^\d+\.\d+\.\d+$")
+
+        # /look version & /look update expose installed version and Hermes update guidance
+        for sub in ("version", "update"):
+            ver_out = surfaces.handle_look_command(sub)
+            self.assertIn(f"v{lat.__version__}", ver_out)
+            self.assertIn("hermes plugins update look-at-this", ver_out)
+
+        # GET /status returns plugin version
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from dashboard.plugin_api import router as api_router
+
+        with tempfile.TemporaryDirectory(prefix="lat-ver-api-") as tmp_home:
+            prev_home = os.environ.get("HERMES_HOME")
+            os.environ["HERMES_HOME"] = tmp_home
+            try:
+                app = FastAPI()
+                app.include_router(api_router)
+                st_res = TestClient(app).get("/status?session_id=").json()
+                self.assertTrue(st_res["ok"])
+                self.assertEqual(st_res["version"], lat.__version__)
+            finally:
+                hotkey_daemon.HOTKEYS.stop()
+                if prev_home is None:
+                    os.environ.pop("HERMES_HOME", None)
+                else:
+                    os.environ["HERMES_HOME"] = prev_home
 
         node = shutil.which("node")
         if node:
