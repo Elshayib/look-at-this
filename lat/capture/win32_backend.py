@@ -55,14 +55,18 @@ _SHELL_IGNORED_EXES = frozenset({
     "searchapp.exe",
     "textinputhost.exe",
     "lockapp.exe",
-    "applicationframehost.exe",
     "systemsettingsbroker.exe",
     "widgets.exe",
     "cua-driver.exe",
     "cua.exe",
 })
 
-_HERMES_EXES = frozenset({"hermes.exe"})
+_HERMES_EXES = frozenset({
+    "hermes.exe",
+    "hermes-desktop.exe",
+    "hermes desktop.exe",
+    "hermes-app.exe",
+})
 
 
 class _BITMAPINFOHEADER(ctypes.Structure):
@@ -340,6 +344,31 @@ def _is_hermes_window(app_exe: str, title: str) -> bool:
     return False
 
 
+def _resolve_uwp_real_process(hwnd: int, host_pid: int) -> tuple[int, str]:
+    """Resolve the inner app PID/exe hosted inside a UWP ApplicationFrameHost window."""
+    user32 = ctypes.windll.user32
+    enum_proc = WNDENUMPROC or ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+    found: tuple[int, str] | None = None
+
+    def _child_cb(child: int, _lp: int) -> bool:
+        nonlocal found
+        cpid = wt.DWORD(0)
+        user32.GetWindowThreadProcessId(child, ctypes.byref(cpid))
+        cpid_int = int(cpid.value)
+        if not cpid_int or cpid_int == host_pid:
+            return True
+        child_exe = _process_exe_name(cpid_int)
+        low = child_exe.lower()
+        if child_exe and low != "applicationframehost.exe" and low not in _SHELL_IGNORED_EXES:
+            found = (cpid_int, child_exe)
+            return False
+        return True
+
+    cb = enum_proc(_child_cb)
+    user32.EnumChildWindows(wt.HWND(hwnd), cb, 0)
+    return found if found is not None else (host_pid, "ApplicationFrameHost.exe")
+
+
 def _ensure_unlocked_desktop() -> None:
     user32 = ctypes.windll.user32
     fg = int(user32.GetForegroundWindow() or 0)
@@ -520,6 +549,8 @@ def list_windows(
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
             pid_int = int(pid.value)
             exe = _process_exe_name(pid_int)
+            if exe and exe.lower() == "applicationframehost.exe":
+                pid_int, exe = _resolve_uwp_real_process(hwnd, pid_int)
             if not exe or exe.lower() in _SHELL_IGNORED_EXES:
                 return True
             if not include_hermes and _is_hermes_window(exe, title):
@@ -542,6 +573,28 @@ def list_windows(
 
         cb = enum_proc(_enum_cb)
         user32.EnumWindows(cb, 0)
+
+        fg_raw = int(user32.GetForegroundWindow() or 0)
+        fg_root = 0
+        if fg_raw:
+            if hasattr(user32, "GetAncestor"):
+                fg_root = int(user32.GetAncestor(fg_raw, 2) or fg_raw)
+            else:
+                fg_root = fg_raw
+        if fg_root:
+            target_ids = (fg_root, fg_raw)
+            promoted = False
+            for fid in target_ids:
+                for idx, w in enumerate(results):
+                    if int(w.window_id) == fid:
+                        if idx > 0:
+                            results.insert(0, results.pop(idx))
+                        promoted = True
+                        break
+                if promoted:
+                    break
+        for idx, w in enumerate(results):
+            w.z_order = idx
 
         # Mark topmost non-excluded window as the default active target
         for w in results:

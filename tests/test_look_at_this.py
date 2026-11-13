@@ -930,6 +930,88 @@ class HotkeyAndSurfaceTests(unittest.TestCase):
                 else:
                     os.environ["HERMES_HOME"] = prev_home
 
+    def test_win32_uwp_hermes_exes_and_foreground_promotion(self) -> None:
+        import ctypes
+        import ctypes.wintypes as wintypes
+        from types import SimpleNamespace
+        from unittest import mock
+        from lat.capture import win32_backend
+        from lat.models import RegionRect, Settings
+
+        self.assertNotIn("applicationframehost.exe", win32_backend._SHELL_IGNORED_EXES)
+        for exe in ("hermes.exe", "hermes-desktop.exe", "hermes desktop.exe", "hermes-app.exe"):
+            self.assertTrue(win32_backend._is_hermes_window(exe, "Any Title"))
+
+        # Test UWP child PID resolution and foreground promotion via mocked user32
+        z_hwnds = [101, 202, 303]
+
+        class FakeUser32:
+            def GetForegroundWindow(self) -> int:
+                return 304  # child of 303
+
+            def GetAncestor(self, hwnd: int, flags: int) -> int:
+                return 303 if hwnd == 304 else hwnd
+
+            def IsWindowVisible(self, hwnd: int) -> bool:
+                return True
+
+            def IsIconic(self, hwnd: int) -> bool:
+                return False
+
+            def GetWindowLongW(self, hwnd: int, idx: int) -> int:
+                return 0
+
+            def GetWindowThreadProcessId(self, hwnd: int, pid_ptr: Any) -> int:
+                # Use ctypes POINTER/byref target if passed, else mock object
+                mapping = {101: 1001, 202: 2002, 303: 3003, 2021: 2222}
+                ctypes.cast(pid_ptr, ctypes.POINTER(ctypes.c_ulong))[0] = mapping[hwnd]
+                return 1
+
+            def EnumWindows(self, cb: Any, lp: int) -> bool:
+                for h in z_hwnds:
+                    if not cb(h, lp):
+                        break
+                return True
+
+            def EnumChildWindows(self, hwnd: Any, cb: Any, lp: int) -> bool:
+                host = hwnd.value if hasattr(hwnd, "value") else int(hwnd)
+                if host == 202:
+                    cb(2021, lp)
+                return True
+
+        fake_user32 = FakeUser32()
+        fake_windll = SimpleNamespace(user32=fake_user32)
+        exes = {
+            1001: "other.exe",
+            2002: "ApplicationFrameHost.exe",
+            2222: "CalculatorApp.exe",
+            3003: "notepad.exe",
+        }
+        titles = {101: "Background", 202: "Calculator", 303: "Notes"}
+
+        with (
+            mock.patch.object(win32_backend, "wt", wintypes, create=True),
+            mock.patch.object(win32_backend, "WNDENUMPROC", lambda fn: fn),
+            mock.patch.object(win32_backend, "_per_monitor_dpi_thread"),
+            mock.patch.object(win32_backend, "_ensure_unlocked_desktop"),
+            mock.patch.object(win32_backend, "_is_dwm_cloaked", return_value=False),
+            mock.patch.object(win32_backend, "_window_title", side_effect=lambda h: titles.get(h, "")),
+            mock.patch.object(
+                win32_backend,
+                "_window_bounds",
+                return_value=RegionRect(x=0, y=0, width=800, height=600),
+            ),
+            mock.patch.object(win32_backend, "_process_exe_name", side_effect=lambda p: exes.get(p, "")),
+            mock.patch.object(ctypes, "windll", fake_windll, create=True),
+        ):
+            wins = win32_backend.list_windows(Settings())
+
+        self.assertEqual([w.window_id for w in wins], [303, 101, 202])
+        self.assertEqual([w.z_order for w in wins], [0, 1, 2])
+        self.assertTrue(wins[0].is_active)
+        self.assertEqual(wins[2].app, "CalculatorApp.exe")
+        self.assertEqual(wins[2].pid, 2222)
+
     def test_win32_ctypes_configure_explicit_64bit_signatures(self) -> None:
         import ctypes
         import ctypes.wintypes as wintypes
