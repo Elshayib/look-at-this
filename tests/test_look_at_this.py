@@ -610,11 +610,37 @@ class VisionInjectionTests(unittest.TestCase):
         resp_parts = res_resp["request"]["input"][0]["content"]
         self.assertEqual(resp_parts[1]["type"], "input_image")
 
-        # 4. Text-only model is skipped cleanly
-        skipped = render.inject_ephemeral_image_into_request(
-            req_oai, screenshot_path=str(self.shot), api_mode="chat_completions", provider="deepseek", model="deepseek-chat"
+        # 4. Anthropic empty string content omits invalid empty text block
+        req_ant_empty = {"system": "sys", "messages": [{"role": "user", "content": ""}]}
+        res_ant_empty = render.inject_ephemeral_image_into_request(
+            req_ant_empty, screenshot_path=str(self.shot), api_mode="anthropic_messages", provider="anthropic", model="claude-sonnet-4-5"
         )
-        self.assertIsNone(skipped)
+        self.assertIsNotNone(res_ant_empty)
+        assert res_ant_empty is not None
+        ant_empty_parts = res_ant_empty["request"]["messages"][0]["content"]
+        self.assertEqual(len(ant_empty_parts), 1)
+        self.assertEqual(ant_empty_parts[0]["type"], "image")
+
+        # 5. OpenAI Responses API with mode="openai_responses" and string input
+        req_resp_str = {"input": "Explain this"}
+        res_resp_str = render.inject_ephemeral_image_into_request(
+            req_resp_str, screenshot_path=str(self.shot), api_mode="openai_responses", provider="openai", model="gpt-4.1"
+        )
+        self.assertIsNotNone(res_resp_str)
+        assert res_resp_str is not None
+        items = res_resp_str["request"]["input"]
+        self.assertIsInstance(items, list)
+        self.assertEqual(items[0]["role"], "user")
+        self.assertEqual(items[0]["content"][0], {"type": "input_text", "text": "Explain this"})
+        self.assertEqual(items[0]["content"][1]["type"], "input_image")
+
+        # 6. Text-only models are skipped cleanly (including expanded model patterns)
+        for text_model in ("deepseek-chat", "deepseek-coder", "o1-preview", "llama-3.1-70b-instruct", "llama-3.3-70b"):
+            skipped = render.inject_ephemeral_image_into_request(
+                req_oai, screenshot_path=str(self.shot), api_mode="chat_completions", provider="openrouter", model=text_model
+            )
+            self.assertIsNone(skipped, text_model)
+        self.assertTrue(render.model_accepts_vision("meta", "llama-3.2-11b-vision-instruct"))
 
 
 class HotkeyAndSurfaceTests(unittest.TestCase):

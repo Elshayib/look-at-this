@@ -17,12 +17,16 @@ MAX_PACKET_CHARS = 9_200
 _TEXT_ONLY_PROVIDERS = frozenset({"cerebras", "groq-text", "cohere"})
 _TEXT_ONLY_MODEL_PATTERNS = (
     "deepseek-chat",
+    "deepseek-coder",
     "deepseek-reasoner",
     "deepseek-r1",
     "deepseek-v3",
     "qwq-",
     "o1-mini",
+    "o1-preview",
     "o3-mini",
+    "llama-3.1-",
+    "llama-3.3-",
 )
 
 
@@ -231,15 +235,31 @@ def inject_ephemeral_image_into_request(
     data_url = f"data:image/png;base64,{b64}"
     mode = str(api_mode or "").strip().lower()
 
-    # 1. OpenAI / Codex Responses API (`input` list)
-    if mode == "codex_responses" or (isinstance(request.get("input"), list) and "messages" not in request):
-        items = list(request.get("input") or [])
+    # 1. OpenAI / Codex Responses API (`input` list or string)
+    if (
+        mode == "codex_responses"
+        or "responses" in mode
+        or (isinstance(request.get("input"), (list, str)) and "messages" not in request)
+    ):
+        raw_input = request.get("input")
+        if isinstance(raw_input, str):
+            content_parts: list[Any] = [{"type": "input_text", "text": raw_input}] if raw_input else []
+            content_parts.append({"type": "input_image", "image_url": data_url})
+            return {
+                "request": {
+                    **request,
+                    "input": [{"type": "message", "role": "user", "content": content_parts}],
+                },
+                "source": "look-at-this",
+                "reason": "ephemeral screen capture vision",
+            }
+        items = list(raw_input or []) if isinstance(raw_input, list) else []
         for idx in range(len(items) - 1, -1, -1):
             item = items[idx]
             if isinstance(item, dict) and item.get("role") == "user":
                 content = item.get("content")
                 if isinstance(content, str):
-                    new_content: list[Any] = [{"type": "input_text", "text": content}]
+                    new_content: list[Any] = [{"type": "input_text", "text": content}] if content else []
                 elif isinstance(content, list):
                     if any(isinstance(p, dict) and p.get("image_url") == data_url for p in content):
                         return None
@@ -273,7 +293,7 @@ def inject_ephemeral_image_into_request(
                 "source": {"type": "base64", "media_type": "image/png", "data": b64},
             }
             if isinstance(content, str):
-                parts: list[Any] = [{"type": "text", "text": content}, img_block]
+                parts: list[Any] = [{"type": "text", "text": content}, img_block] if content else [img_block]
             elif isinstance(content, list):
                 if any(
                     isinstance(p, dict)
