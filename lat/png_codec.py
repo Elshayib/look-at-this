@@ -7,6 +7,7 @@ into valid PNG files and base64 data URLs using CPython slice operations + zlib.
 from __future__ import annotations
 
 import base64
+from pathlib import Path
 import struct
 import zlib
 
@@ -163,6 +164,149 @@ def read_png_dimensions(png_bytes: bytes) -> tuple[int, int] | None:
     if w <= 0 or h <= 0:
         return None
     return int(w), int(h)
+
+
+def _paeth_predictor(a: int, b: int, c: int) -> int:
+    p = a + b - c
+    pa = abs(p - a)
+    pb = abs(p - b)
+    pc = abs(p - c)
+    if pa <= pb and pa <= pc:
+        return a
+    if pb <= pc:
+        return b
+    return c
+
+
+def decode_png_to_bgra(png_bytes: bytes) -> tuple[bytes, int, int]:
+    """Decode an 8-bit non-interlaced Gray/RGB/GA/RGBA PNG into top-down BGRA bytes."""
+    if not png_bytes.startswith(PNG_SIGNATURE):
+        raise ValueError("Not a PNG stream")
+
+    pos = len(PNG_SIGNATURE)
+    width = height = bit_depth = color_type = interlace = 0
+    saw_ihdr = False
+    idat_parts: list[bytes] = []
+
+    while pos + 8 <= len(PNG_bytes := png_bytes):
+        length = struct.unpack(">I", PNG_bytes[pos : pos + 4])[0]
+        ctype = PNG_bytes[pos + 4 : pos + 8]
+        data_start = pos + 8
+        data_end = data_start + length
+        if data_end + 4 > len(PNG_bytes):
+            break
+        cdata = PNG_bytes[data_start:data_end]
+        pos = data_end + 4
+        if ctype == b"IHDR" and len(cdata) >= 13:
+            width, height, bit_depth, color_type, comp, flt, interlace = struct.unpack(">IIBBBBB", cdata[:13])
+            if comp != 0 or flt != 0:
+                raise ValueError("Unsupported PNG compression or filter method")
+            saw_ihdr = True
+        elif ctype == b"IDAT":
+            idat_parts.append(cdata)
+        elif ctype == b"IEND":
+            break
+
+    if not saw_ihdr or width <= 0 or height <= 0:
+        raise ValueError("Missing or invalid PNG IHDR chunk")
+    if bit_depth != 8 or interlace != 0:
+        raise ValueError(f"Unsupported PNG format (bit_depth={bit_depth}, interlace={interlace})")
+
+    channels_map = {0: 1, 2: 3, 4: 2, 6: 4}
+    bpp = channels_map.get(color_type)
+    if bpp is None:
+        raise ValueError(f"Unsupported PNG color type: {color_type}")
+
+    raw_scanlines = zlib.decompress(b"".join(idat_parts))
+    row_bytes = width * bpp
+    expected = (row_bytes + 1) * height
+    if len(raw_scanlines) < expected:
+        raise ValueError("Truncated PNG scanline data")
+
+    prev_row = bytearray(row_bytes)
+    bgra = bytearray(width * height * 4)
+    src_stride = row_bytes + 1
+
+    for y in range(height):
+        s_off = y * src_stride
+        ftype = raw_scanlines[s_off]
+        cur = bytearray(raw_scanlines[s_off + 1 : s_off + 1 + row_bytes])
+
+        if ftype == 0:
+            pass
+        elif ftype == 1:
+            for i in range(bpp, row_bytes):
+                cur[i] = (cur[i] + cur[i - bpp]) & 0xFF
+        elif ftype == 2:
+            for i in range(row_bytes):
+                cur[i] = (cur[i] + prev_row[i]) & 0xFF
+        elif ftype == 3:
+            for i in range(row_bytes):
+                left = cur[i - bpp] if i >= bpp else 0
+                cur[i] = (cur[i] + ((left + prev_row[i]) >> 1)) & 0xFF
+        elif ftype == 4:
+            for i in range(row_bytes):
+                left = cur[i - bpp] if i >= bpp else 0
+                up = prev_row[i]
+                up_left = prev_row[i - bpp] if i >= bpp else 0
+                cur[i] = (cur[i] + _paeth_predictor(left, up, up_left)) & 0xFF
+        else:
+            raise ValueError(f"Unsupported PNG scanline filter type: {ftype}")
+
+        prev_row = cur
+        d_row = y * width * 4
+        if color_type == 2:  # RGB
+            bgra[d_row + 0 : d_row + width * 4 : 4] = cur[2::3]
+            bgra[d_row + 1 : d_row + width * 4 : 4] = cur[1::3]
+            bgra[d_row + 2 : d_row + width * 4 : 4] = cur[0::3]
+            bgra[d_row + 3 : d_row + width * 4 : 4] = b"\xff" * width
+        elif color_type == 6:  # RGBA
+            bgra[d_row + 0 : d_row + width * 4 : 4] = cur[2::4]
+            bgra[d_row + 1 : d_row + width * 4 : 4] = cur[1::4]
+            bgra[d_row + 2 : d_row + width * 4 : 4] = cur[0::4]
+            bgra[d_row + 3 : d_row + width * 4 : 4] = cur[3::4]
+        elif color_type == 0:  # Grayscale
+            bgra[d_row + 0 : d_row + width * 4 : 4] = cur
+            bgra[d_row + 1 : d_row + width * 4 : 4] = cur
+            bgra[d_row + 2 : d_row + width * 4 : 4] = cur
+            bgra[d_row + 3 : d_row + width * 4 : 4] = b"\xff" * width
+        else:  # color_type == 4: Gray + Alpha
+            bgra[d_row + 0 : d_row + width * 4 : 4] = cur[0::2]
+            bgra[d_row + 1 : d_row + width * 4 : 4] = cur[0::2]
+            bgra[d_row + 2 : d_row + width * 4 : 4] = cur[0::2]
+            bgra[d_row + 3 : d_row + width * 4 : 4] = cur[1::2]
+
+    return bytes(bgra), width, height
+
+
+def postprocess_png_file(
+    path: Path,
+    max_dim: int,
+    *,
+    thumb_max_dim: int = 360,
+) -> tuple[int | None, int | None, str | None]:
+    """Enforce *max_dim* on a PNG file on disk and return ``(width, height, thumb_data_url)``."""
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None, None, None
+    dims = read_png_dimensions(raw)
+    try:
+        bgra, w, h = decode_png_to_bgra(raw)
+    except ValueError:
+        w, h = dims if dims else (None, None)
+        return w, h, png_bytes_to_data_url(raw, max_bytes=900_000)
+
+    out_w, out_h = w, h
+    if max_dim > 0 and max(w, h) > max_dim:
+        resized_bytes, out_w, out_h = encode_bgra_png(bgra, w, h, max_dim=max_dim, level=2)
+        try:
+            path.write_bytes(resized_bytes)
+        except OSError:
+            pass
+
+    thumb = bgra_to_thumbnail_data_url(bgra, w, h, max_dim=thumb_max_dim)
+    return out_w, out_h, thumb
 
 
 def buffer_is_blank(bgra: bytes | bytearray | memoryview) -> bool:

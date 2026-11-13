@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-import base64
+import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
+from typing import Any
 import uuid
 
 from ..models import (
@@ -18,20 +20,78 @@ from ..models import (
     Settings,
     WindowInfo,
 )
-from ..png_codec import read_png_dimensions
+from ..png_codec import postprocess_png_file
 from ..privacy import check_window_exclusion, find_overlapping_excluded_window
-from ..store import get_shots_dir, safe_unlink_shot
+from ..store import get_shots_dir
 
 
-def _png_meta(path: Path) -> tuple[int | None, int | None, str | None]:
+def _png_meta(path: Path, *, max_dim: int = 0) -> tuple[int | None, int | None, str | None]:
+    return postprocess_png_file(path, max_dim=max_dim)
+
+
+def _linux_process_name(pid: int) -> str:
+    """Resolve full Linux process executable name without 15-char /proc/comm truncation."""
+    if pid <= 0:
+        return "linux-app"
+    exe_link = Path(f"/proc/{pid}/exe")
     try:
-        raw = path.read_bytes()
+        target = os.readlink(exe_link)
+        name = Path(target.removesuffix(" (deleted)")).name.strip()
+        if name:
+            return name
     except OSError:
-        return None, None, None
-    dims = read_png_dimensions(raw)
-    w, h = dims if dims else (None, None)
-    thumb = ("data:image/png;base64," + base64.b64encode(raw).decode("ascii")) if len(raw) <= 900_000 else None
-    return w, h, thumb
+        pass
+    cmdline = Path(f"/proc/{pid}/cmdline")
+    try:
+        if cmdline.is_file():
+            raw = cmdline.read_bytes().split(b"\x00", 1)[0].decode("utf-8", errors="replace").strip()
+            if raw:
+                name = Path(raw).name.strip()
+                if name:
+                    return name
+    except OSError:
+        pass
+    comm = Path(f"/proc/{pid}/comm")
+    try:
+        if comm.is_file():
+            name = comm.read_text(encoding="utf-8", errors="replace").strip()
+            if name:
+                return name
+    except OSError:
+        pass
+    return "linux-app"
+
+
+def _parse_xid(raw: Any) -> int | None:
+    try:
+        s = str(raw or "").strip()
+        if not s:
+            return None
+        return int(s, 16) if s.lower().startswith("0x") else int(s)
+    except ValueError:
+        return None
+
+
+def _x11_active_window_id() -> int | None:
+    if not shutil.which("xprop"):
+        return None
+    try:
+        res = subprocess.run(
+            ["xprop", "-root", "_NET_ACTIVE_WINDOW"],
+            capture_output=True,
+            text=True,
+            timeout=1.5,
+        )
+        out = (res.stdout or "").strip()
+        # Format: "_NET_ACTIVE_WINDOW(WINDOW): window id # 0x4a00007"
+        for tok in reversed(out.replace(",", " ").split()):
+            if tok.lower().startswith("0x"):
+                xid = _parse_xid(tok)
+                if xid:
+                    return xid
+    except Exception:
+        pass
+    return None
 
 
 def _read_selection_x11_wayland() -> str | None:
@@ -63,11 +123,7 @@ def list_windows(settings: Settings, *, include_thumbnails: bool = False) -> lis
                 w, h = int(w_s), int(h_s)
                 if w < 80 or h < 60 or not title.strip():
                     continue
-                app = "linux-app"
-                if pid:
-                    comm = Path(f"/proc/{pid}/comm")
-                    if comm.is_file():
-                        app = comm.read_text(encoding="utf-8", errors="replace").strip() or app
+                app = _linux_process_name(pid)
                 if app.lower() == "hermes":
                     continue
                 rule = check_window_exclusion(app, title, settings)
@@ -86,14 +142,44 @@ def list_windows(settings: Settings, *, include_thumbnails: bool = False) -> lis
         except Exception:
             pass
 
+    active_xid = _x11_active_window_id()
+    if active_xid is not None and out:
+        for idx, w in enumerate(out):
+            if _parse_xid(w.window_id) == active_xid:
+                if idx > 0:
+                    out.insert(0, out.pop(idx))
+                break
+    for idx, w in enumerate(out):
+        w.z_order = idx
+
     for w in out:
         if not w.is_excluded:
             w.is_active = True
             break
+
+    if include_thumbnails and (shutil.which("grim") or shutil.which("import")):
+        with tempfile.TemporaryDirectory(prefix="lat-linthumb-") as tmpdir:
+            for idx, w in enumerate(out[:12]):
+                if w.is_excluded:
+                    continue
+                tmp_png = Path(tmpdir) / f"t_{idx}.png"
+                try:
+                    _shoot_rect(w.bounds, tmp_png, wid=str(w.window_id), allow_active_window_tool=False)
+                    if tmp_png.is_file():
+                        _, _, w.thumbnail_data_url = postprocess_png_file(tmp_png, max_dim=280, thumb_max_dim=280)
+                except Exception:
+                    w.thumbnail_data_url = None
+
     return out
 
 
-def _shoot_rect(rect: RegionRect, out_file: Path, wid: str | None = None) -> None:
+def _shoot_rect(
+    rect: RegionRect,
+    out_file: Path,
+    wid: str | None = None,
+    *,
+    allow_active_window_tool: bool = False,
+) -> None:
     if shutil.which("grim"):
         subprocess.run(
             ["grim", "-g", f"{rect.x},{rect.y} {rect.width}x{rect.height}", str(out_file)],
@@ -108,7 +194,7 @@ def _shoot_rect(rect: RegionRect, out_file: Path, wid: str | None = None) -> Non
             capture_output=True,
             timeout=8,
         )
-    elif shutil.which("gnome-screenshot"):
+    elif allow_active_window_tool and shutil.which("gnome-screenshot"):
         subprocess.run(["gnome-screenshot", "-w", "-f", str(out_file)], capture_output=True, timeout=8)
     else:
         raise CaptureBackendError(
@@ -154,10 +240,15 @@ def capture_target_window(
     thumb = None
     if include_screenshot:
         out_file = get_shots_dir() / f"lat_{cid}.png"
-        _shoot_rect(target.bounds, out_file, wid=str(target.window_id))
+        _shoot_rect(
+            target.bounds,
+            out_file,
+            wid=str(target.window_id),
+            allow_active_window_tool=bool(target.is_active),
+        )
         if out_file.is_file():
             shot_path = str(out_file)
-            w_px, h_px, thumb = _png_meta(out_file)
+            w_px, h_px, thumb = _png_meta(out_file, max_dim=settings.max_image_dim)
 
     return RawCapture(
         capture_id=cid,
@@ -167,7 +258,7 @@ def capture_target_window(
         window_id=target.window_id,
         title=target.title,
         bounds=target.bounds,
-        selection=_read_selection_x11_wayland(),
+        selection=_read_selection_x11_wayland() if target.is_active else None,
         screenshot_path=shot_path,
         screenshot_width=w_px,
         screenshot_height=h_px,
@@ -201,7 +292,7 @@ def capture_region_rect(rect: RegionRect, settings: Settings, *, include_tree: b
     _shoot_rect(rect, out_file)
     if not out_file.is_file():
         raise CaptureBackendError("Linux screenshot capture failed.")
-    w_px, h_px, thumb = _png_meta(out_file)
+    w_px, h_px, thumb = _png_meta(out_file, max_dim=settings.max_image_dim)
     return RawCapture(
         capture_id=cid,
         mode="region",
@@ -253,7 +344,7 @@ def interactive_snip(settings: Settings, *, include_tree: bool = False) -> RawCa
 
     if not out_file.is_file():
         raise CaptureCancelledError("Capture cancelled.")
-    w_px, h_px, thumb = _png_meta(out_file)
+    w_px, h_px, thumb = _png_meta(out_file, max_dim=settings.max_image_dim)
     return RawCapture(
         capture_id=cid,
         mode="region",

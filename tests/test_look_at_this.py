@@ -45,6 +45,164 @@ class PngCodecTests(unittest.TestCase):
         thumb_url = png_codec.bgra_to_thumbnail_data_url(bgra, w, h, max_dim=24)
         self.assertTrue(thumb_url.startswith("data:image/png;base64,"))
 
+    def test_decode_png_to_bgra_and_postprocess_file(self) -> None:
+        import struct
+        import zlib
+
+        w, h = 40, 20
+        bgra = bytearray(w * h * 4)
+        for y in range(h):
+            for x in range(w):
+                idx = (y * w + x) * 4
+                bgra[idx : idx + 4] = bytes(((x * 7) % 256, (y * 11) % 256, (x + y * 2) % 256, 255))
+
+        png_bytes, _, _ = png_codec.encode_bgra_png(bgra, w, h)
+        decoded, dw, dh = png_codec.decode_png_to_bgra(png_bytes)
+        self.assertEqual((dw, dh), (w, h))
+        self.assertEqual(bytes(bgra), decoded)
+
+        # Verify scanline filter types 1..4 (Sub, Up, Avg, Paeth) decode cleanly for RGBA PNGs
+        rgba = bytearray(4 * 4 * 4)
+        for i in range(0, len(rgba), 4):
+            rgba[i : i + 4] = bytes(((i * 3) % 256, (i * 5) % 256, (i * 7) % 256, 200))
+        row_b = 4 * 4
+        scanlines = bytearray()
+        prev = bytes(row_b)
+        for y, ftype in enumerate((0, 1, 2, 4)):
+            row = rgba[y * row_b : (y + 1) * row_b]
+            scanlines.append(ftype)
+            if ftype == 0:
+                scanlines.extend(row)
+            elif ftype == 1:
+                scanlines.extend((row[i] - (row[i - 4] if i >= 4 else 0)) & 0xFF for i in range(row_b))
+            elif ftype == 2:
+                scanlines.extend((row[i] - prev[i]) & 0xFF for i in range(row_b))
+            else:
+                scanlines.extend(
+                    (
+                        row[i]
+                        - png_codec._paeth_predictor(
+                            row[i - 4] if i >= 4 else 0,
+                            prev[i],
+                            prev[i - 4] if i >= 4 else 0,
+                        )
+                    )
+                    & 0xFF
+                    for i in range(row_b)
+                )
+            prev = bytes(row)
+        filtered_png = (
+            png_codec.PNG_SIGNATURE
+            + png_codec._png_chunk(b"IHDR", struct.pack(">IIBBBBB", 4, 4, 8, 6, 0, 0, 0))
+            + png_codec._png_chunk(b"IDAT", zlib.compress(bytes(scanlines)))
+            + png_codec._png_chunk(b"IEND", b"")
+        )
+        f_bgra, fw, fh = png_codec.decode_png_to_bgra(filtered_png)
+        self.assertEqual((fw, fh), (4, 4))
+        self.assertEqual((f_bgra[2], f_bgra[1], f_bgra[0], f_bgra[3]), tuple(rgba[0:4]))
+
+        with tempfile.TemporaryDirectory(prefix="lat-pngpp-") as tmp:
+            p = Path(tmp) / "big.png"
+            p.write_bytes(png_bytes)
+            out_w, out_h, thumb = png_codec.postprocess_png_file(p, max_dim=20, thumb_max_dim=16)
+            self.assertEqual((out_w, out_h), (20, 10))
+            self.assertEqual(png_codec.read_png_dimensions(p.read_bytes()), (20, 10))
+            self.assertIsNotNone(thumb)
+            assert thumb is not None
+            self.assertTrue(thumb.startswith("data:image/png;base64,"))
+
+
+class MacOSAndLinuxBackendTests(unittest.TestCase):
+    def test_macos_frontmost_sort_applescript_escape_and_downscale(self) -> None:
+        from unittest import mock
+        from types import SimpleNamespace
+        from lat.capture import macos_backend
+
+        self.assertIn("frontmost()", macos_backend._JXA_WINDOWS)
+        self.assertIn(".sort(", macos_backend._JXA_WINDOWS)
+
+        with mock.patch.object(
+            macos_backend.subprocess,
+            "run",
+            return_value=SimpleNamespace(stdout="https://example.com\n"),
+        ) as run_mock:
+            url = macos_backend._macos_browser_url('Google "Chrome"\\App')
+        self.assertEqual(url, "https://example.com")
+        script_arg = run_mock.call_args[0][0][-1]
+        self.assertIn(r'Google \"Chrome\"\\App', script_arg)
+
+        # Downscales large PNG via postprocess_png_file and populates thumbnail even off macOS
+        bgra = bytearray([20, 40, 60, 255] * (40 * 20))
+        png_bytes, _, _ = png_codec.encode_bgra_png(bgra, 40, 20)
+        with tempfile.TemporaryDirectory(prefix="lat-mac-") as tmp:
+            p = Path(tmp) / "cap.png"
+            p.write_bytes(png_bytes)
+            with mock.patch.object(macos_backend.shutil, "which", return_value=None):
+                w, h, thumb = macos_backend._png_thumb(str(p), max_dim=20)
+            self.assertEqual((w, h), (20, 10))
+            self.assertIsNotNone(thumb)
+
+    def test_linux_active_window_process_resolution_and_gnome_screenshot_guard(self) -> None:
+        from unittest import mock
+        from types import SimpleNamespace
+        from lat.capture import linux_backend
+
+        # _linux_process_name falls back exe -> cmdline -> comm
+        with mock.patch.object(linux_backend.os, "readlink", return_value="/usr/lib/firefox/firefox-bin (deleted)"):
+            self.assertEqual(linux_backend._linux_process_name(1234), "firefox-bin")
+
+        # list_windows promotes _NET_ACTIVE_WINDOW to index 0 with z_order=0
+        wmctrl_out = (
+            "0x02000001  0 111  0   0 800 600 host Inactive Term\n"
+            "0x04a00007  0 222 10  10 900 700 host Active Editor\n"
+        )
+        with (
+            mock.patch.object(linux_backend.shutil, "which", side_effect=lambda c: f"/usr/bin/{c}" if c in {"wmctrl", "xprop"} else None),
+            mock.patch.object(
+                linux_backend.subprocess,
+                "run",
+                side_effect=[
+                    SimpleNamespace(stdout=wmctrl_out),
+                    SimpleNamespace(stdout="_NET_ACTIVE_WINDOW(WINDOW): window id # 0x4a00007\n"),
+                ],
+            ),
+            mock.patch.object(linux_backend, "_linux_process_name", side_effect=lambda p: "code" if p == 222 else "alacritty"),
+        ):
+            wins = linux_backend.list_windows(models.Settings())
+
+        self.assertEqual(len(wins), 2)
+        self.assertEqual(wins[0].window_id, "0x04a00007")
+        self.assertEqual(wins[0].z_order, 0)
+        self.assertTrue(wins[0].is_active)
+        self.assertEqual(wins[1].z_order, 1)
+
+        # Region capture never invokes gnome-screenshot -w
+        with (
+            mock.patch.object(linux_backend.shutil, "which", side_effect=lambda c: "/usr/bin/gnome-screenshot" if c == "gnome-screenshot" else None),
+            mock.patch.object(linux_backend, "list_windows", return_value=[]),
+        ):
+            with self.assertRaises(models.CaptureBackendError):
+                linux_backend.capture_region_rect(models.RegionRect(0, 0, 200, 200), models.Settings())
+
+        # Background window capture must NOT attach global primary selection
+        with (
+            mock.patch.object(linux_backend, "list_windows", return_value=wins),
+            mock.patch.object(linux_backend, "_read_selection_x11_wayland", return_value="secret primary selection") as sel_mock,
+        ):
+            bg_cap = linux_backend.capture_target_window(
+                models.Settings(),
+                window_id="0x02000001",
+                include_screenshot=False,
+            )
+            self.assertIsNone(bg_cap.selection)
+            sel_mock.assert_not_called()
+            act_cap = linux_backend.capture_target_window(
+                models.Settings(),
+                window_id="0x04a00007",
+                include_screenshot=False,
+            )
+            self.assertEqual(act_cap.selection, "secret primary selection")
+
 
 class PrivacyAndRedactionTests(unittest.TestCase):
     def test_exclusions_block_password_managers_and_incognito_but_allow_code_titles(self) -> None:

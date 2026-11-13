@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-import base64
 import json
+from pathlib import Path
+import shutil
 import subprocess
+import tempfile
 import uuid
 
 from ..models import (
@@ -17,19 +19,32 @@ from ..models import (
     Settings,
     WindowInfo,
 )
-from ..png_codec import read_png_dimensions
+from ..png_codec import postprocess_png_file, read_png_dimensions
 from ..privacy import check_window_exclusion, find_overlapping_excluded_window
 from ..store import get_shots_dir
 
 _JXA_WINDOWS = r"""
 const se = Application('System Events');
 const procs = se.applicationProcesses.whose({ visible: true })();
+const procList = [];
+for (const p of procs) {
+  procList.push(p);
+}
+procList.sort(function(a, b) {
+  let fa = 0;
+  let fb = 0;
+  try { fa = a.frontmost() ? 1 : 0; } catch (e) {}
+  try { fb = b.frontmost() ? 1 : 0; } catch (e) {}
+  return fb - fa;
+});
 const out = [];
 let z = 0;
-for (const p of procs) {
+for (const p of procList) {
   let name = '';
   let pid = 0;
+  let isFront = false;
   try { name = p.name(); pid = p.unixId(); } catch (e) { continue; }
+  try { isFront = Boolean(p.frontmost()); } catch (e) {}
   if (!name || name.toLowerCase() === 'hermes') continue;
   let wins = [];
   try { wins = p.windows(); } catch (e) { continue; }
@@ -44,6 +59,7 @@ for (const p of procs) {
         pid: pid,
         app: name,
         title: title,
+        frontmost: isFront,
         bounds: { x: pos[0], y: pos[1], width: sz[0], height: sz[1] },
         z_order: z++
       });
@@ -54,24 +70,28 @@ JSON.stringify(out);
 """
 
 
-def _png_thumb(path_str: str) -> tuple[int | None, int | None, str | None]:
-    from pathlib import Path
-
-    try:
-        raw = Path(path_str).read_bytes()
-    except OSError:
-        return None, None, None
-    dims = read_png_dimensions(raw)
-    w, h = dims if dims else (None, None)
-    thumb = ("data:image/png;base64," + base64.b64encode(raw).decode("ascii")) if len(raw) <= 900_000 else None
-    return w, h, thumb
+def _png_thumb(path_str: str, *, max_dim: int = 0) -> tuple[int | None, int | None, str | None]:
+    path = Path(path_str)
+    if max_dim > 0 and shutil.which("sips") and path.is_file():
+        try:
+            dims = read_png_dimensions(path.read_bytes())
+            if dims and max(dims) > max_dim:
+                subprocess.run(
+                    ["sips", "-Z", str(int(max_dim)), str(path)],
+                    capture_output=True,
+                    timeout=8,
+                )
+        except Exception:
+            pass
+    return postprocess_png_file(path, max_dim=max_dim)
 
 
 def _macos_browser_url(app_name: str) -> str | None:
     low = app_name.lower()
+    safe_app = str(app_name or "").replace("\\", "\\\\").replace('"', '\\"')
     script = ""
     if "chrome" in low or "brave" in low or "edge" in low or "arc" in low:
-        script = f'tell application "{app_name}" to get URL of active tab of front window'
+        script = f'tell application "{safe_app}" to get URL of active tab of front window'
     elif "safari" in low:
         script = 'tell application "Safari" to get URL of current tab of front window'
     if not script:
@@ -123,6 +143,23 @@ def list_windows(settings: Settings, *, include_thumbnails: bool = False) -> lis
         if not w.is_excluded:
             w.is_active = True
             break
+    if include_thumbnails and shutil.which("screencapture"):
+        with tempfile.TemporaryDirectory(prefix="lat-macthumb-") as tmpdir:
+            for idx, w in enumerate(out[:12]):
+                if w.is_excluded:
+                    continue
+                tmp_png = Path(tmpdir) / f"t_{idx}.png"
+                try:
+                    b = w.bounds
+                    subprocess.run(
+                        ["screencapture", "-x", "-R", f"{b.x},{b.y},{b.width},{b.height}", str(tmp_png)],
+                        capture_output=True,
+                        timeout=4,
+                    )
+                    if tmp_png.is_file():
+                        _, _, w.thumbnail_data_url = postprocess_png_file(tmp_png, max_dim=280, thumb_max_dim=280)
+                except Exception:
+                    w.thumbnail_data_url = None
     return out
 
 
@@ -168,7 +205,7 @@ def capture_target_window(
         )
         if out_file.is_file():
             shot_path = str(out_file)
-            w_px, h_px, thumb = _png_thumb(shot_path)
+            w_px, h_px, thumb = _png_thumb(shot_path, max_dim=settings.max_image_dim)
 
     return RawCapture(
         capture_id=cid,
@@ -203,7 +240,7 @@ def capture_region_rect(rect: RegionRect, settings: Settings, *, include_tree: b
     )
     if not out_file.is_file():
         raise CaptureBackendError("macOS screencapture produced no image (check Screen Recording permission).")
-    w_px, h_px, thumb = _png_thumb(str(out_file))
+    w_px, h_px, thumb = _png_thumb(str(out_file), max_dim=settings.max_image_dim)
     return RawCapture(
         capture_id=cid,
         mode="region",
@@ -232,7 +269,7 @@ def interactive_snip(settings: Settings, *, include_tree: bool = False) -> RawCa
     subprocess.run(["screencapture", "-i", "-x", str(out_file)], capture_output=True, timeout=120)
     if not out_file.is_file():
         raise CaptureCancelledError("Capture cancelled.")
-    w_px, h_px, thumb = _png_thumb(str(out_file))
+    w_px, h_px, thumb = _png_thumb(str(out_file), max_dim=settings.max_image_dim)
     return RawCapture(
         capture_id=cid,
         mode="region",
