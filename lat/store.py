@@ -287,21 +287,67 @@ class EphemeralStore:
         clean = str(session_id or "").strip()
         return clean if clean else UNBOUND_SESSION
 
-    def set_preference_override(self, key: str, value: str) -> None:
+    def set_preference_override(
+        self,
+        key: str,
+        value: Any,
+        *,
+        baseline: Any = None,
+        config_mtime: float = 0.0,
+    ) -> None:
+        record = {
+            "v": 2,
+            "value": value,
+            "baseline": baseline,
+            "config_mtime": float(config_mtime or 0.0),
+        }
         with self._lock, self._connect() as conn:
             conn.execute(
                 "INSERT INTO runtime_state(key, value, updated_at) VALUES (?, ?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-                (f"pref:{key}", str(value), time.time()),
+                (f"pref:{key}", json.dumps(record, ensure_ascii=False), time.time()),
             )
 
-    def get_preference_override(self, key: str) -> str | None:
+    def clear_preference_override(self, key: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM runtime_state WHERE key = ?", (f"pref:{key}",))
+
+    def get_preference_entry(self, key: str) -> dict[str, Any] | None:
         with self._lock, self._connect() as conn:
             row = conn.execute(
-                "SELECT value FROM runtime_state WHERE key = ?",
+                "SELECT value, updated_at FROM runtime_state WHERE key = ?",
                 (f"pref:{key}",),
             ).fetchone()
-            return str(row[0]) if row and row[0] is not None else None
+            if not row or row[0] is None:
+                return None
+            raw = str(row[0])
+            updated_at = float(row[1] or 0.0)
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict) and parsed.get("v") == 2 and "value" in parsed:
+                    return {
+                        "value": parsed.get("value"),
+                        "baseline": parsed.get("baseline"),
+                        "config_mtime": float(parsed.get("config_mtime") or 0.0),
+                        "updated_at": updated_at,
+                        "legacy": False,
+                    }
+            except Exception:
+                pass
+            return {
+                "value": raw,
+                "baseline": None,
+                "config_mtime": 0.0,
+                "updated_at": updated_at,
+                "legacy": True,
+            }
+
+    def get_preference_override(self, key: str) -> str | None:
+        entry = self.get_preference_entry(key)
+        if not entry:
+            return None
+        val = entry.get("value")
+        return str(val) if val is not None else None
 
     def set_focused_session(self, session_id: str) -> None:
         clean = str(session_id or "").strip()

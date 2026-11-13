@@ -1257,6 +1257,91 @@ class HotkeyAndSurfaceTests(unittest.TestCase):
         finally:
             worker.close()
 
+    def test_settings_yaml_precedence_over_stale_sqlite_and_full_post_settings(self) -> None:
+        from unittest import mock
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+        from dashboard.plugin_api import router
+
+        with tempfile.TemporaryDirectory(prefix="lat-cfg-") as tmp:
+            prev_home = os.environ.get("HERMES_HOME")
+            os.environ["HERMES_HOME"] = tmp
+            try:
+                # 1. Legacy or baseline-backed SQLite override yields when config.yaml provides an updated value
+                store.STORE.set_preference_override("hotkey_target", "ask", baseline="new_session", config_mtime=100.0)
+                with mock.patch.object(
+                    models,
+                    "_read_yaml_plugin_settings",
+                    return_value=({"hotkey_target": "current_session"}, 200.0),
+                ):
+                    loaded = models.load_live_settings()
+                self.assertEqual(loaded.hotkey_target, "current_session")
+
+                # Legacy bare string override also yields when config.yaml sets hotkey_target
+                store.STORE.set_preference_override("hotkey_target", "ask")
+                with mock.patch.object(
+                    models,
+                    "_read_yaml_plugin_settings",
+                    return_value=({"hotkey_target": "new_session"}, time.time() + 10.0),
+                ):
+                    loaded2 = models.load_live_settings()
+                self.assertEqual(loaded2.hotkey_target, "new_session")
+
+                # 2. POST /settings persists all setting fields, validates invalid inputs, and reloads hotkeys
+                app = FastAPI()
+                app.include_router(router)
+                client = TestClient(app)
+
+                bad_hk = client.post("/settings", json={"window_hotkey": "x"})
+                self.assertEqual(bad_hk.status_code, 400)
+                bad_target = client.post("/settings", json={"hotkey_target": "bogus_mode"})
+                self.assertEqual(bad_target.status_code, 400)
+
+                with mock.patch.object(hotkey_daemon.HOTKEYS, "reload", return_value={}) as reload_mock:
+                    res = client.post(
+                        "/settings",
+                        json={
+                            "hotkey_target": "ask",
+                            "window_hotkey": "ctrl+alt+k",
+                            "ttl_seconds": 600,
+                            "vision_injection": False,
+                            "default_redact": True,
+                            "focus_hermes_on_hotkey": False,
+                            "hotkey_hud_feedback": False,
+                            "include_full_tree_by_default": True,
+                            "max_tree_elements": 450,
+                            "max_image_dim": 1280,
+                            "excluded_apps": ["1password", "customvault"],
+                            "excluded_title_patterns": [r"(?i)secret"],
+                        },
+                    )
+                self.assertEqual(res.status_code, 200, res.text)
+                reload_mock.assert_called_once()
+                saved = res.json()["settings"]
+                self.assertEqual(saved["hotkey_target"], "ask")
+                self.assertEqual(saved["window_hotkey"], "ctrl+alt+k")
+                self.assertEqual(saved["ttl_seconds"], 600)
+                self.assertFalse(saved["vision_injection"])
+                self.assertTrue(saved["default_redact"])
+                self.assertFalse(saved["focus_hermes_on_hotkey"])
+                self.assertFalse(saved["hotkey_hud_feedback"])
+                self.assertTrue(saved["include_full_tree_by_default"])
+                self.assertEqual(saved["max_tree_elements"], 450)
+                self.assertEqual(saved["max_image_dim"], 1280)
+                self.assertEqual(saved["excluded_apps"], ["1password", "customvault"])
+                self.assertEqual(saved["excluded_title_patterns"], [r"(?i)secret"])
+
+                # GET /settings reads back persisted values
+                fetched = client.get("/settings").json()["settings"]
+                self.assertEqual(fetched["window_hotkey"], "ctrl+alt+k")
+                self.assertTrue(fetched["default_redact"])
+            finally:
+                hotkey_daemon.HOTKEYS.stop()
+                if prev_home is None:
+                    os.environ.pop("HERMES_HOME", None)
+                else:
+                    os.environ["HERMES_HOME"] = prev_home
+
     def test_desktop_plugin_contract(self) -> None:
         src = (ROOT / "desktop" / "plugin.js").read_text(encoding="utf-8")
         self.assertIn("focusedStoredSessionId", src)

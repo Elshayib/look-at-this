@@ -18,6 +18,7 @@ from .models import (
     Settings,
     load_live_settings,
     normalize_fields,
+    write_yaml_plugin_setting,
 )
 from .render import (
     format_cli_preview,
@@ -47,13 +48,16 @@ def bind_context(
 
 
 def set_plugin_config(key: str, value: Any) -> bool:
+    wrote = False
     if _CONFIG_SETTER is not None:
         try:
             _CONFIG_SETTER(key, value)
-            return True
+            wrote = True
         except Exception:
             pass
-    return False
+    if write_yaml_plugin_setting(key, value):
+        wrote = True
+    return wrote
 
 
 def current_settings() -> Settings:

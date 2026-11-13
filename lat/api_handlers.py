@@ -15,13 +15,14 @@ from fastapi import APIRouter, Body, Query
 from fastapi.responses import JSONResponse
 
 from . import capture
-from .hotkey_daemon import HOTKEYS
+from .hotkey_daemon import HOTKEYS, parse_hotkey_chord
 from .models import (
     ALL_FIELDS,
     CaptureCancelledError,
     LookAtError,
     RegionRect,
     SCHEMA_VERSION,
+    _read_yaml_plugin_settings,
     load_live_settings,
     normalize_hotkey_target,
 )
@@ -42,12 +43,110 @@ def _error_response(exc: Exception, status: int = 400) -> JSONResponse:
     )
 
 
+_HOTKEY_TARGET_ALIASES = frozenset({
+    "new_session", "new",
+    "ask", "prompt", "choose", "picker",
+    "current", "current_session", "active", "active_session", "same",
+})
+_INT_SETTING_BOUNDS: dict[str, tuple[int, int]] = {
+    "ttl_seconds": (30, 3600),
+    "max_tree_elements": (20, 1500),
+    "max_image_dim": (640, 3840),
+}
+_BOOL_SETTING_KEYS = frozenset({
+    "focus_hermes_on_hotkey",
+    "hotkey_hud_feedback",
+    "vision_injection",
+    "default_redact",
+    "include_full_tree_by_default",
+})
+_LIST_SETTING_KEYS = frozenset({"excluded_apps", "excluded_title_patterns"})
+_HOTKEY_SETTING_KEYS = frozenset({"window_hotkey", "snip_hotkey"})
+
+
+def _validate_and_persist_settings(payload: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    if not isinstance(payload, dict):
+        raise LookAtError("Settings payload must be a JSON object.", code="invalid_setting")
+
+    validated: dict[str, Any] = {}
+    hotkeys_changed = False
+
+    if "hotkey_target" in payload:
+        raw_hk = str(payload["hotkey_target"] or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if raw_hk not in _HOTKEY_TARGET_ALIASES:
+            raise LookAtError(
+                f"Invalid hotkey_target: {payload['hotkey_target']!r}. Expected new_session, ask, or current_session.",
+                code="invalid_setting",
+            )
+        validated["hotkey_target"] = normalize_hotkey_target(raw_hk)
+
+    for key in _HOTKEY_SETTING_KEYS:
+        if key in payload:
+            raw_chord = "" if payload[key] is None else str(payload[key]).strip()
+            try:
+                parse_hotkey_chord(raw_chord)
+            except ValueError as exc:
+                raise LookAtError(str(exc), code="invalid_hotkey") from exc
+            validated[key] = raw_chord
+            hotkeys_changed = True
+
+    for key in _BOOL_SETTING_KEYS:
+        if key in payload:
+            val = payload[key]
+            if isinstance(val, bool):
+                validated[key] = val
+            elif isinstance(val, str):
+                low = val.strip().lower()
+                if low in {"1", "true", "yes", "on"}:
+                    validated[key] = True
+                elif low in {"0", "false", "no", "off"}:
+                    validated[key] = False
+                else:
+                    raise LookAtError(f"Invalid boolean for {key}: {val!r}", code="invalid_setting")
+            elif isinstance(val, (int, float)):
+                validated[key] = bool(val)
+            else:
+                raise LookAtError(f"Invalid boolean for {key}: {val!r}", code="invalid_setting")
+
+    for key, (lo, hi) in _INT_SETTING_BOUNDS.items():
+        if key in payload:
+            try:
+                num = int(payload[key])
+            except (TypeError, ValueError) as exc:
+                raise LookAtError(f"Invalid integer for {key}: {payload[key]!r}", code="invalid_setting") from exc
+            validated[key] = max(lo, min(hi, num))
+
+    for key in _LIST_SETTING_KEYS:
+        if key in payload:
+            raw_list = payload[key]
+            if isinstance(raw_list, str):
+                items = [line.strip() for line in raw_list.replace(",", "\n").splitlines() if line.strip()]
+            elif isinstance(raw_list, (list, tuple)):
+                items = [str(x).strip() for x in raw_list if str(x).strip()]
+            else:
+                raise LookAtError(f"Invalid list for {key}", code="invalid_setting")
+            validated[key] = items
+
+    if validated:
+        raw_yaml, cfg_mtime = _read_yaml_plugin_settings()
+        for key, val in validated.items():
+            if set_plugin_config(key, val):
+                STORE.clear_preference_override(key)
+            else:
+                STORE.set_preference_override(
+                    key,
+                    val,
+                    baseline=raw_yaml.get(key),
+                    config_mtime=cfg_mtime,
+                )
+        emit_plugin_event("settings.changed", validated)
+
+    return validated, hotkeys_changed
+
+
 def _persist_hotkey_target(value: str) -> str:
-    norm = normalize_hotkey_target(value)
-    STORE.set_preference_override("hotkey_target", norm)
-    set_plugin_config("hotkey_target", norm)
-    emit_plugin_event("settings.changed", {"hotkey_target": norm})
-    return norm
+    updated, _ = _validate_and_persist_settings({"hotkey_target": value})
+    return str(updated["hotkey_target"])
 
 
 def build_router() -> APIRouter:
@@ -264,9 +363,9 @@ def build_router() -> APIRouter:
             return _error_response(exc)
 
     def _update_settings(payload: dict[str, Any]) -> dict[str, Any]:
-        updated: dict[str, Any] = {}
-        if "hotkey_target" in payload:
-            updated["hotkey_target"] = _persist_hotkey_target(str(payload["hotkey_target"]))
+        updated, hotkeys_changed = _validate_and_persist_settings(payload)
+        if hotkeys_changed:
+            HOTKEYS.reload()
         cfg = load_live_settings()
         return {"ok": True, "updated": updated, "settings": cfg.to_dict()}
 

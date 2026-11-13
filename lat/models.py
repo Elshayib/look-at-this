@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields as dataclass_fields
 from datetime import datetime, timezone
 import math
+import os
+from pathlib import Path
 import re
 import time
 from typing import Any, Callable
@@ -335,33 +337,125 @@ class Settings:
         return asdict(self)
 
 
+def _hermes_config_path() -> Path:
+    home = os.environ.get("HERMES_HOME")
+    base = Path(home) if home else (Path.home() / ".hermes")
+    return base / "config.yaml"
+
+
+def _read_yaml_plugin_settings() -> tuple[dict[str, Any], float]:
+    cfg_path = _hermes_config_path()
+    try:
+        mtime = cfg_path.stat().st_mtime if cfg_path.exists() else 0.0
+    except OSError:
+        mtime = 0.0
+
+    cfg: dict[str, Any] = {}
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        loaded = load_config_readonly()
+        if isinstance(loaded, dict):
+            cfg = loaded
+    except Exception:
+        if cfg_path.exists():
+            try:
+                import yaml  # type: ignore[import-untyped]
+
+                loaded = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    cfg = loaded
+            except Exception:
+                pass
+
+    entry = (((cfg.get("plugins") or {}).get("entries") or {}).get("look-at-this") or {})
+    settings_map = entry.get("settings")
+    if isinstance(settings_map, dict):
+        return dict(settings_map), mtime
+    return {}, mtime
+
+
+def write_yaml_plugin_setting(key: str, value: Any) -> bool:
+    """Persist a plugin setting into Hermes config.yaml when available."""
+    cfg_path = _hermes_config_path()
+    try:
+        from hermes_cli.config import load_config, save_config  # type: ignore[attr-defined]
+
+        cfg = load_config()
+        if not isinstance(cfg, dict):
+            cfg = {}
+        plugins = cfg.setdefault("plugins", {})
+        entries = plugins.setdefault("entries", {})
+        entry = entries.setdefault("look-at-this", {})
+        settings_map = entry.setdefault("settings", {})
+        settings_map[key] = value
+        save_config(cfg)
+        return True
+    except Exception:
+        pass
+
+    if not cfg_path.exists():
+        return False
+    try:
+        import yaml  # type: ignore[import-untyped]
+
+        loaded = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+        cfg = loaded if isinstance(loaded, dict) else {}
+        plugins = cfg.setdefault("plugins", {})
+        entries = plugins.setdefault("entries", {})
+        entry = entries.setdefault("look-at-this", {})
+        settings_map = entry.setdefault("settings", {})
+        settings_map[key] = value
+        cfg_path.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
+        return True
+    except Exception:
+        return False
+
+
 def load_live_settings(override_getter: Callable[..., Any] | None = None) -> Settings:
     """Load live settings from config.yaml (or an explicit ctx.get_config callable)."""
     if override_getter is not None:
-        cfg_obj = Settings.from_getter(override_getter)
-    else:
         raw: dict[str, Any] = {}
-        try:
-            from hermes_cli.config import load_config_readonly
+        for f in dataclass_fields(Settings):
+            try:
+                val = override_getter(f.name, default=None)
+            except TypeError:
+                val = override_getter(f.name)
+            if val is not None:
+                raw[f.name] = val
+        cfg_mtime = 0.0
+    else:
+        raw, cfg_mtime = _read_yaml_plugin_settings()
 
-            cfg = load_config_readonly() or {}
-            entry = (((cfg.get("plugins") or {}).get("entries") or {}).get("look-at-this") or {})
-            settings_map = entry.get("settings")
-            if isinstance(settings_map, dict):
-                raw = settings_map
-        except Exception:
-            raw = {}
-        cfg_obj = Settings.from_getter(lambda k, default=None: raw.get(k, default))
-
+    merged = dict(raw)
     try:
         from .store import STORE
 
-        hk_override = STORE.get_preference_override("hotkey_target")
-        if hk_override:
-            cfg_obj.hotkey_target = normalize_hotkey_target(hk_override)
+        for f in dataclass_fields(Settings):
+            entry = STORE.get_preference_entry(f.name)
+            if not entry:
+                continue
+            has_yaml_val = f.name in raw and raw[f.name] is not None
+            if entry.get("legacy"):
+                # Legacy bare SQLite override: respect config.yaml whenever it specifies a value
+                # or was modified after the SQLite row.
+                if has_yaml_val or (cfg_mtime > float(entry.get("updated_at") or 0.0)):
+                    STORE.clear_preference_override(f.name)
+                    continue
+            else:
+                baseline = entry.get("baseline")
+                saved_mtime = float(entry.get("config_mtime") or 0.0)
+                yaml_val = raw.get(f.name)
+                if (has_yaml_val and yaml_val != baseline) or (
+                    cfg_mtime > 0.0 and saved_mtime > 0.0 and cfg_mtime > saved_mtime + 1e-6 and has_yaml_val
+                ) or (cfg_mtime > 0.0 and saved_mtime == 0.0 and has_yaml_val):
+                    STORE.clear_preference_override(f.name)
+                    continue
+            merged[f.name] = entry.get("value")
     except Exception:
         pass
-    return cfg_obj
+
+    return Settings.from_getter(lambda k, default=None: merged.get(k, default))
 
 
 @dataclass

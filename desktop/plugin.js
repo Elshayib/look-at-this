@@ -296,6 +296,27 @@ async function saveHotkeyTargetPreference(nextTarget) {
   }
 }
 
+async function savePluginSettings(patch) {
+  try {
+    const res = await rest('/settings', {
+      method: 'POST',
+      body: patch
+    })
+    if (!res || res.ok !== true) {
+      throw new Error((res && res.error) || 'Failed to save settings')
+    }
+    haptic('tap')
+    invalidateStatus()
+    return res
+  } catch (err) {
+    host.notify({
+      kind: 'error',
+      message: `Look At This: ${err && err.message ? err.message : String(err)}`
+    })
+    return null
+  }
+}
+
 async function runCapture(mode, extra = {}) {
   if ($capturing.get()) {
     return null
@@ -1726,7 +1747,7 @@ function SettingsOverviewPage() {
                   }),
                   jsx(Button, {
                     size: 'sm',
-                    onClick: () => host.navigate(`/settings?tab=plugins&agent=${PLUGIN_ID}`),
+                    onClick: () => host.navigate(`/settings?tab=plugins&plugin=${PLUGIN_ID}`),
                     children: 'Configure shortcuts & privacy'
                   })
                 ]
@@ -1819,9 +1840,56 @@ function SettingsOverviewPage() {
         title: 'Strict Ephemerality & Vision Delivery',
         description:
           'Screenshots are injected ephemerally into the model request for one turn only, never stored in session history, and deleted from disk as soon as the turn completes.',
-        action: jsx(Badge, {
-          variant: settings.vision_injection !== false ? 'success' : 'muted',
+        action: jsx(Button, {
+          size: 'sm',
+          variant: settings.vision_injection !== false ? 'default' : 'outline',
+          onClick: () => void savePluginSettings({ vision_injection: settings.vision_injection === false }),
           children: settings.vision_injection !== false ? 'Direct Vision ON' : 'Path Fallback Only'
+        })
+      }),
+      jsx(ListRow, {
+        title: 'Auto-Redact Sensitive Text by Default',
+        description:
+          'Mask API keys, OAuth tokens, JWTs, credentials, and card numbers before sending packet context to the model.',
+        action: jsx(Button, {
+          size: 'sm',
+          variant: settings.default_redact === true ? 'default' : 'outline',
+          onClick: () => void savePluginSettings({ default_redact: settings.default_redact !== true }),
+          children: settings.default_redact === true ? 'Auto-Redact ON' : 'Auto-Redact OFF'
+        })
+      }),
+      jsx(ListRow, {
+        title: 'Focus Hermes Window on Global Hotkey',
+        description:
+          'Automatically bring Hermes Desktop to the foreground right after a global hotkey capture finishes.',
+        action: jsx(Button, {
+          size: 'sm',
+          variant: settings.focus_hermes_on_hotkey !== false ? 'default' : 'outline',
+          onClick: () => void savePluginSettings({ focus_hermes_on_hotkey: settings.focus_hermes_on_hotkey === false }),
+          children: settings.focus_hermes_on_hotkey !== false ? 'Auto-Focus ON' : 'Auto-Focus OFF'
+        })
+      }),
+      jsx(ListRow, {
+        title: 'HUD Capture Toast Notification',
+        description:
+          'Show a brief non-intrusive visual HUD pill on Windows when a global shortcut captures a window.',
+        action: jsx(Button, {
+          size: 'sm',
+          variant: settings.hotkey_hud_feedback !== false ? 'default' : 'outline',
+          onClick: () => void savePluginSettings({ hotkey_hud_feedback: settings.hotkey_hud_feedback === false }),
+          children: settings.hotkey_hud_feedback !== false ? 'HUD Toast ON' : 'HUD Toast OFF'
+        })
+      }),
+      jsx(ListRow, {
+        title: 'Include Full Accessibility Tree by Default',
+        description:
+          'Automatically walk and include the full UI automation hierarchy on every window capture.',
+        action: jsx(Button, {
+          size: 'sm',
+          variant: settings.include_full_tree_by_default === true ? 'default' : 'outline',
+          onClick: () =>
+            void savePluginSettings({ include_full_tree_by_default: settings.include_full_tree_by_default !== true }),
+          children: settings.include_full_tree_by_default === true ? 'Full Tree ON' : 'On Demand'
         })
       })
     ]
