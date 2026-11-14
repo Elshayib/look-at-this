@@ -1,8 +1,8 @@
-"""Authenticated gateway REST route handlers for Look At This.
+"""Shared FastAPI router for ``/api/plugins/look-at-this/*``.
 
-Shared by ``dashboard/plugin_api.py`` and live ``reload_gateway_plugins`` route
-hot-swapping so the HTTP API and the agent hooks always share one process-wide
-``HOTKEYS`` and ``STORE`` state.
+Mounted by ``dashboard/plugin_api.py`` (Hermes Desktop's ``plugin_host``
+subprocess and ``hermes_cli.web_server``) so the HTTP API and agent hooks
+always share one process-wide ``HOTKEYS`` and ``STORE`` state.
 """
 
 from __future__ import annotations

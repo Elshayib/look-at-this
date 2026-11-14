@@ -6,44 +6,12 @@ import logging
 import sys
 from pathlib import Path
 
-from .lat import api_handlers, hotkey_daemon, surfaces
+from .lat import hotkey_daemon, surfaces
 from .lat.capture import uia_worker
 
 __version__ = "0.2.1"
 
 logger = logging.getLogger(__name__)
-
-
-def _refresh_mounted_web_routes() -> None:
-    """Hot-swap ``/api/plugins/look-at-this`` routes if ``web_server`` is already live."""
-    web_mod = sys.modules.get("hermes_cli.web_server")
-    app = getattr(web_mod, "app", None)
-    if app is None or not hasattr(app, "router"):
-        return
-    try:
-        prefix = "/api/plugins/look-at-this"
-        routes = app.router.routes
-        deps = None
-        first_idx: int | None = None
-        kept = []
-        for idx, route in enumerate(routes):
-            rpath = str(getattr(route, "path", "") or "")
-            if rpath == prefix or rpath.startswith(prefix + "/"):
-                if first_idx is None:
-                    first_idx = idx
-                    deps = list(getattr(route, "dependencies", None) or [])
-                continue
-            kept.append(route)
-        if first_idx is None:
-            # Not mounted yet — web_server_dashboard hot-mount will pick up plugin_api.py on first request
-            return
-        before_len = len(routes)
-        app.include_router(api_handlers.build_router(), prefix=prefix, dependencies=deps or [])
-        fresh = list(routes[before_len:])
-        routes[:] = kept[:first_idx] + fresh + kept[first_idx:]
-        logger.info("look-at-this: refreshed %d live API routes on web_server", len(fresh))
-    except Exception:
-        logger.debug("look-at-this: live API route refresh skipped", exc_info=True)
 
 
 def register(ctx) -> None:
@@ -117,7 +85,6 @@ def register(ctx) -> None:
                 legacy_hk_mod.HOTKEYS.stop()
             except Exception:
                 pass
-        _refresh_mounted_web_routes()
         hk = hotkey_daemon.HOTKEYS.reload()
         if hasattr(ctx, "on_unload"):
             ctx.on_unload(hotkey_daemon.HOTKEYS.stop)
