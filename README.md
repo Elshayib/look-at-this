@@ -4,6 +4,8 @@ On-demand, strictly ephemeral screen, window, and region context for **Hermes Ag
 
 **Look At This** attaches a screenshot and structured UI context from any application window or screen region directly to your next Hermes turn—via a system-wide hotkey, an interactive window picker, a crosshair snipping overlay, or `/look`. Nothing is captured in the background, screenshots are never written into `state.db` chat transcripts, and temporary image files are deleted as soon as the turn completes.
 
+![Look At This](assets/look-at-this.png)
+
 ```text
 1. Trigger   Ctrl+Alt+L (active window) · Ctrl+Alt+S (snip / click window) · /look
 2. Review    Preview thumbnail, toggle fields, apply text redaction, choose session
